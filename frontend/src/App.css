@@ -1,0 +1,571 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* Reset */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* Common variables */
+  --radius: 16px;
+  --radius-sm: 8px;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+body.dark {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-hover: #334155;
+  --border: #334155;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --brand: #6366f1;
+  --brand-muted: rgba(99, 102, 241, 0.15);
+  --card: #1e293b;
+  --accent: #6366f1;
+}
+
+body.light {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-hover: #f1f5f9;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --brand: #6366f1;
+  --brand-muted: rgba(99, 102, 241, 0.15);
+  --card: #ffffff;
+  --accent: #6366f1;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+/* ── App Layout ─────────────────────────────────────────────── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Header */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 60px;
+  background: rgba(24, 24, 27, 0.8);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+}
+
+/* Light mode: header should be bright white */
+body.light .app-header {
+  background: var(--surface);
+  backdrop-filter: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-icon {
+  width: 28px;
+  height: 28px;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.brand-text {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+.brand-tagline {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 400;
+  margin-top: 2px;
+  letter-spacing: 0.2px;
+}
+
+/* Main Spilt */
+.app-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+}
+
+.pane-graph {
+  flex: 0 0 65%;
+  position: relative;
+}
+
+.pane-chat {
+  flex: 1;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* ── Network Graph ──────────────────────────────────────────── */
+.graph-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  background: var(--bg);
+}
+
+.react-flow__node {
+  border-radius: 12px;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.react-flow__node:hover {
+  transform: scale(1.05);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+}
+
+.react-flow__edge-path {
+  stroke: var(--text-muted);
+  stroke-width: 2;
+  transition: stroke 0.3s, stroke-width 0.3s;
+}
+
+.react-flow__edge.highlighted .react-flow__edge-path {
+  stroke: var(--brand);
+  stroke-width: 3;
+}
+
+/* Graph Header overlays */
+.graph-overlay-top {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  right: 20px;
+  z-index: 5;
+  display: flex;
+  gap: 12px;
+  pointer-events: none;
+  /* Let clicks pass through empty space */
+}
+
+.graph-overlay-top>* {
+  pointer-events: auto;
+}
+
+/* But allow clicks on actual items */
+
+.search-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  box-shadow: var(--shadow);
+  width: 300px;
+  backdrop-filter: blur(8px);
+}
+
+.search-box input {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 8px 0;
+  font-size: 13px;
+  flex: 1;
+  outline: none;
+}
+
+.search-box button {
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.search-box button:hover {
+  color: var(--text);
+}
+
+/* Loading UI & Errors */
+.graph-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-hover);
+  opacity: 0.8;
+  backdrop-filter: blur(4px);
+  z-index: 10;
+  font-size: 14px;
+  color: var(--text-muted);
+  gap: 10px;
+}
+
+.error-toast {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #ef4444;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+  z-index: 20;
+}
+
+/* Floating Card for Node Details */
+.node-details-card {
+  position: absolute;
+  top: 80px;
+  right: 24px;
+  width: 300px;
+  background: var(--card);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--shadow);
+  z-index: 10;
+  animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.details-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.details-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.details-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.close-btn:hover {
+  color: var(--text);
+}
+
+.details-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.details-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.details-lbl {
+  color: var(--text-muted);
+}
+
+.details-val {
+  font-weight: 500;
+  color: var(--text);
+  text-align: right;
+  word-break: break-all;
+  max-width: 60%;
+}
+
+/* ── Chat View ────────────────────────────────────────────────── */
+.chat-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.chat-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.msg {
+  display: flex;
+  gap: 12px;
+  max-width: 90%;
+}
+
+.msg.user {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+.msg.bot {
+  align-self: flex-start;
+}
+
+.msg-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.msg.user .msg-avatar {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.msg.bot .msg-avatar {
+  background: var(--brand);
+  color: #fff;
+}
+
+.msg-bubble {
+  background: var(--surface);
+  padding: 12px 16px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.msg.user .msg-bubble {
+  background: var(--surface-hover);
+  border-color: var(--border);
+  border-top-right-radius: 4px;
+}
+
+.msg.bot .msg-bubble {
+  border-top-left-radius: 4px;
+}
+
+/* Simple table for data results inside chat */
+.chat-data-table {
+  width: 100%;
+  margin-top: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.chat-data-table th,
+.chat-data-table td {
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-data-table th {
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.chat-data-table tr:last-child td {
+  border-bottom: none;
+}
+
+.chat-input-container {
+  padding: 20px 24px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+.chat-input-box {
+  display: flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 6px 6px 6px 16px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  align-items: center;
+}
+
+.chat-input-box input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+
+.chat-input-box input::placeholder {
+  color: var(--text-muted);
+}
+
+.chat-send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--brand);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.2s, background 0.2s;
+}
+
+.chat-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chat-send-btn:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+/* Typing animation */
+.loader-dots {
+  display: flex;
+  gap: 4px;
+  height: 16px;
+  align-items: center;
+}
+
+.loader-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: bounce 1.4s infinite ease-in-out both;
+}
+
+.loader-dots span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.loader-dots span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes bounce {
+
+  0%,
+  80%,
+  100% {
+    transform: scale(0);
+  }
+
+  40% {
+    transform: scale(1);
+  }
+}
+
+.shimmer {
+  display: inline-block;
+  backdrop-filter: blur(4px);
+  animation: shimmer 2s infinite linear;
+}
+
+/* React Flow Controls Override (both themes) */
+.custom-react-flow-controls button {
+  background-color: var(--card) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+
+.custom-react-flow-controls button:hover {
+  background-color: var(--surface-hover) !important;
+}
+
+.custom-react-flow-controls button svg {
+  fill: var(--text-muted) !important;
+}
+
+.custom-react-flow-controls button:hover svg {
+  fill: var(--text) !important;
+}
+
+/* Light mode: Force React Flow canvas background + edge label visibility */
+body.light .react-flow__renderer {
+  background: #f9fafb !important;
+}
+
+body.light .react-flow__edge-textbg {
+  fill: #ffffff !important;
+}
+
+body.light .react-flow__edge-text {
+  fill: #374151 !important;
+}
+
+/* Smooth theme transitions */
+body {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
