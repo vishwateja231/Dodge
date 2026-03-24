@@ -5,10 +5,20 @@ import TableView from './TableView';
 
 const GraphMessage = ({ payload, onEntityDetect }) => {
     const [showTable, setShowTable] = useState(true);
+    const overview = payload.overview || {};
+    const overviewItems = Object.entries(overview).filter(([k]) => k !== 'columns');
 
     return (
         <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            <div style={{ whiteSpace: 'pre-wrap' }}>{payload.summary || 'Query completed.'}</div>
+            <div style={{ fontWeight: 600 }}>API Overview</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {overviewItems.map(([k, v]) => (
+                    <span key={k} style={{ fontSize: '12px', background: 'var(--surface-hover)', padding: '4px 8px', borderRadius: '6px' }}>
+                        {k.replace(/_/g, ' ')}: {String(v)}
+                    </span>
+                ))}
+            </div>
+            <div style={{ whiteSpace: 'pre-wrap', color: 'var(--text-muted)' }}>{payload.summary || 'Query completed.'}</div>
 
             {showTable && payload.data && payload.data.length > 0 && (
                 <TableView data={payload.data} />
@@ -38,6 +48,7 @@ export default function Chat({ onEntityDetect }) {
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [loadingText, setLoadingText] = useState('Processing...');
+    const [popup, setPopup] = useState(null);
 
     const scrollRef = useRef(null);
     const inputRef = useRef(null);
@@ -89,12 +100,20 @@ export default function Chat({ onEntityDetect }) {
                 setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: data.message || 'No data found' }]);
             } else {
                 const errorMsg = data.message || data.error || 'Internal error';
+                if (/limit exceeded|quota|rate/i.test(errorMsg)) {
+                    setPopup('LLM API limit exceeded. Please try again later.');
+                    setTimeout(() => setPopup(null), 4000);
+                }
                 setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: errorMsg }]);
             }
         } catch (err) {
             const message = err?.name === 'AbortError'
                 ? 'Request timed out. Please try again.'
                 : 'Internal connection error. Please try again.';
+            if (/timeout|connection|network/i.test(message)) {
+                setPopup(message);
+                setTimeout(() => setPopup(null), 3000);
+            }
             setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: message }]);
         } finally {
             setLoading(false);
@@ -165,6 +184,21 @@ export default function Chat({ onEntityDetect }) {
                         </div>
                     );
                 })}
+                {popup && (
+                    <div style={{
+                        position: 'fixed',
+                        top: 80,
+                        right: 20,
+                        background: '#ef4444',
+                        color: '#fff',
+                        padding: '10px 14px',
+                        borderRadius: '8px',
+                        zIndex: 9999,
+                        fontSize: '13px'
+                    }}>
+                        {popup}
+                    </div>
+                )}
 
                 {loading && (
                     <div style={{ display: 'flex', width: '100%', justifyContent: 'flex-start' }}>

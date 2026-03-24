@@ -257,6 +257,18 @@ def format_small_result(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def build_overview(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"row_count": 0}
+    first = rows[0]
+    overview: Dict[str, Any] = {"row_count": len(rows), "columns": list(first.keys())[:10]}
+    for key in ("customer_id", "order_id", "delivery_id", "invoice_id", "payment_id", "product_id"):
+        values = [r.get(key) for r in rows if r.get(key) not in (None, "")]
+        if values:
+            overview[f"unique_{key}"] = len(set(values))
+    return overview
+
+
 def _error_response(msg: str, detail: str = "") -> Dict[str, Any]:
     return {
         "type": "error",
@@ -498,7 +510,8 @@ async def build_query_response(question: str) -> Dict[str, Any]:
     # Step 6: Graph builder (only when rows is non-empty)
     graph_data: Dict[str, Any] = graph_builder.build_graph(rows)
 
-    summary_text = await summarize(question, sql, rows)
+    overview = build_overview(rows)
+    summary_text = f"Query executed successfully. Returned {len(rows)} row(s)."
 
     logger.info("[OK] %d rows | %d nodes | %d edges",
                 len(rows), len(graph_data["nodes"]), len(graph_data["edges"]))
@@ -506,6 +519,7 @@ async def build_query_response(question: str) -> Dict[str, Any]:
     return {
         "type": "graph",
         "summary": summary_text,
+        "overview": overview,
         "data": list(itertools.islice(rows, 50)),
         "graph": graph_data,
     }

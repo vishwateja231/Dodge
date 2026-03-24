@@ -47,6 +47,12 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
     const [selectedNodeData, setSelectedNodeData] = useState(null);
     const [graphVersion, setGraphVersion] = useState(0);
 
+    useEffect(() => {
+        if (!error) return;
+        const timer = setTimeout(() => setError(null), 3000);
+        return () => clearTimeout(timer);
+    }, [error]);
+
     const applyForceLayout = useCallback((rawNodes, rawEdges) => {
         const simNodes = rawNodes.map(n => ({ ...n }));
         const simEdges = rawEdges.map(e => ({ ...e, source: e.source, target: e.target }));
