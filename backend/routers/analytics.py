@@ -55,9 +55,9 @@ def delivery_performance():
     sql = """
     SELECT
         COUNT(*)                                              AS shipped_orders,
-        ROUND(AVG(JULIANDAY(d.ship_date) - JULIANDAY(o.order_date)), 1) AS avg_days,
-        MIN(JULIANDAY(d.ship_date) - JULIANDAY(o.order_date))           AS min_days,
-        MAX(JULIANDAY(d.ship_date) - JULIANDAY(o.order_date))           AS max_days
+        ROUND(AVG((d.ship_date::date - o.order_date::date)), 1) AS avg_days,
+        MIN((d.ship_date::date - o.order_date::date))           AS min_days,
+        MAX((d.ship_date::date - o.order_date::date))           AS max_days
     FROM orders o
     JOIN deliveries d ON d.order_id = o.order_id AND d.goods_status = 'C'
     WHERE d.ship_date IS NOT NULL AND o.order_date IS NOT NULL
@@ -118,11 +118,8 @@ def pipeline_summary():
         "total_payments_received": "SELECT COUNT(*) FROM payments WHERE is_incoming = 1",
         "total_products":          "SELECT COUNT(*) FROM products WHERE is_deleted = 0",
     }
-    import sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
     result = {}
     for key, sql in sql_counts.items():
-        result[key] = conn.execute(sql).fetchone()[0]
-    conn.close()
+        rows = db_query(sql)
+        result[key] = list(rows[0].values())[0] if rows else 0
     return result

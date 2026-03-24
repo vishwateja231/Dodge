@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { sendQuery } from '../services/api';
+import { sendQuery, sendQueryStream } from '../services/api';
 import { Loader2, Send } from 'lucide-react';
 import TableView from './TableView';
 
@@ -63,6 +63,7 @@ export default function Chat({ onEntityDetect }) {
     ]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
+    const [loadingText, setLoadingText] = useState('Processing...');
 
     const scrollRef = useRef(null);
     const inputRef = useRef(null);
@@ -88,14 +89,26 @@ export default function Chat({ onEntityDetect }) {
         const userMsg = { id: Date.now().toString(), role: 'user', type: 'text', content: text };
         setMessages((prev) => [...prev, userMsg]);
         setLoading(true);
+        setLoadingText('Fetching data...');
 
         try {
-            const data = await sendQuery(text);
-
-            if (data.type === 'error') {
-                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: data.answer }]);
+            let data;
+            try {
+                data = await sendQueryStream(text, (status) => {
+                    if (status) setLoadingText(status);
+                });
+            } catch {
+                data = await sendQuery(text);
             }
-            else if (data.type === 'list') {
+
+            if (data.type === 'error' || data.error) {
+                const errorMsg = data.error || data.answer || "Internal error";
+                if (errorMsg.includes("LLM limit exceeded")) {
+                    alert("LLM limit reached. Please try again later.");
+                }
+                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: errorMsg }]);
+            }
+            else if (data.type === 'list' || data.type === 'graph') {
                 setMessages((prev) => [...prev, {
                     id: Date.now().toString(),
                     role: 'ai',
@@ -107,15 +120,27 @@ export default function Chat({ onEntityDetect }) {
                 setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: data.answer || "No matching data found." }]);
             }
 
-            if (data.type === 'list' && onEntityDetect && (data.intent === 'trace_order' || data.entities?.order_id)) {
-                onEntityDetect(data.entities);
+            if ((data.type === 'list' || data.type === 'graph') && onEntityDetect) {
+                if (data.graph && (data.graph.nodes?.length > 0)) {
+                    onEntityDetect(data.graph);
+                } else if (data.intent === 'trace_order' || data.entities?.order_id) {
+                    onEntityDetect(data.entities);
+                }
             }
 
         } catch (err) {
             setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: "Internal connection error. Please try again." }]);
         } finally {
             setLoading(false);
+            setLoadingText('Processing...');
             if (inputRef.current) inputRef.current.focus();
+        }
+    };
+
+    const handleInputKeyDown = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            send();
         }
     };
 
@@ -189,7 +214,7 @@ export default function Chat({ onEntityDetect }) {
                             borderTopLeftRadius: '4px', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: '8px'
                         }}>
                             <Loader2 size={16} className="animate-spin text-slate-400" />
-                            <span style={{ color: 'var(--text-muted)', fontSize: '14px' }}>Processing...</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '14px' }}>{loadingText}</span>
                         </div>
                     </div>
                 )}
@@ -213,20 +238,27 @@ export default function Chat({ onEntityDetect }) {
                         alignItems: 'center'
                     }}
                 >
-                    <input
+                    <textarea
                         ref={inputRef}
-                        type="text"
                         placeholder="Message Dodge AI..."
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={handleInputKeyDown}
                         disabled={loading}
+                        rows={1}
                         style={{
                             flex: 1,
                             background: 'transparent',
                             border: 'none',
                             color: 'var(--text)',
                             fontSize: '15px',
-                            outline: 'none'
+                            outline: 'none',
+                            resize: 'none',
+                            minHeight: '24px',
+                            maxHeight: '120px',
+                            lineHeight: '1.4',
+                            paddingTop: '6px',
+                            paddingBottom: '6px'
                         }}
                     />
                     <button

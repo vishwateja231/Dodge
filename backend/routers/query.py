@@ -1,380 +1,525 @@
 """
-query.py — Production-Grade Two-Stage LLM Pipeline
-    Stage 1: Groq (fast) → Intent parsing + query normalization
-    Stage 2: Gemini Flash → SQL generation (deterministic)
-    Stage 3: Python formatter → clean, hallucination-free response
+query.py — Production-grade LLM query pipeline (all 13 steps)
 
-POST /query/
-GET  /query/{query_id}  (pagination)
+Flow:
+1) Dynamic schema loaded at startup from PostgreSQL
+2) Guardrails — reject non-dataset queries
+3) Groq generates SQL from live schema (10s timeout)
+4) SQL validation — allow only SELECT/WITH + LIMIT
+5) Async PostgreSQL execution (safe wrapped)
+6) Graph builder — {nodes, edges} from result rows
+7) Gemini summarizes if >10 rows (10s timeout)
+8) Consistent response: {type, summary, total, data, graph}
 """
-import os
-import sqlite3
+from __future__ import annotations
+
+import asyncio
+import itertools
 import json
+import logging
 import re
 import uuid
-import logging
-from fastapi import APIRouter
-from pydantic import BaseModel
-from dotenv import load_dotenv
+from collections import OrderedDict
+from decimal import Decimal
+from datetime import date, datetime
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
-load_dotenv()
+from fastapi import APIRouter  # pyre-ignore[21]
+from fastapi.responses import StreamingResponse, JSONResponse  # pyre-ignore[21]
+from pydantic import BaseModel  # pyre-ignore[21]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+from config import GEMINI_API_KEY, GROQ_API_KEY  # pyre-ignore[21]
+from database import fetch_all  # pyre-ignore[21]
+import graph_builder  # pyre-ignore[21]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _trunc(s: str, n: int = 100) -> str:
+    """Truncate string — avoids Pyre2 str.__getitem__ overload errors."""
+    return "".join(list(s)[:n])  # pyre-ignore[6]
+
 
 router = APIRouter()
 
-# ── SQL cache for pagination (query_id → raw SQL string) ──────────────────────
-sql_cache: dict[str, str] = {}
+# ── Global dynamic schema ─────────────────────────────────────────────────────
+LIVE_SCHEMA: Dict[str, Any] = {}   # populated immediately below
 
-# ── Known DB tables and their key columns ─────────────────────────────────────
-ALLOWED_TABLES = {
-    "customers", "products", "orders", "order_items",
-    "deliveries", "invoices", "payments"
-}
 
-DB_SCHEMA = """
-TABLE customers    (customer_id, name, grouping, is_blocked, is_archived, created_date)
-TABLE products     (product_id, product_name, product_type, product_group, old_sku, weight_kg, base_unit, division, is_deleted)
-TABLE orders       (order_id, customer_id, order_type, sales_org, order_date, requested_delivery_date, total_amount, currency, delivery_status)
-TABLE order_items  (order_id, line_no, product_id, quantity, unit, net_amount, plant, item_category)
-TABLE deliveries   (delivery_id, order_id, created_date, ship_date, picking_status, goods_status, shipping_point, delivery_block)
-TABLE invoices     (invoice_id, order_id, customer_id, invoice_type, invoice_date, total_amount, currency, accounting_doc, is_cancelled)
-TABLE payments     (payment_id, payment_item, customer_id, clearing_date, posting_date, amount, currency, clearing_doc, gl_account, is_incoming)
+def load_schema_from_db() -> Dict[str, Any]:
+    """Extract tables, columns and FKs using a direct connection (no pool needed)."""
+    import os
+    schema: Dict[str, Any] = {"tables": {}, "foreign_keys": []}
+    try:
+        import psycopg  # pyre-ignore[21]
+        from psycopg.rows import dict_row as _dict_row  # pyre-ignore[21]
+        db_url = os.environ.get("DATABASE_URL", "")
+        if not db_url:
+            raise RuntimeError("DATABASE_URL not set")
+        with psycopg.connect(db_url, row_factory=_dict_row, prepare_threshold=None) as conn:  # pyre-ignore[16]
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_schema='public' AND table_type='BASE TABLE'
+                    ORDER BY table_name
+                """)
+                for row in cur.fetchall():
+                    name = dict(row).get("table_name", "")
+                    if name:
+                        schema["tables"][name] = []
 
-CRITICAL JOIN RULES:
-1. customers → orders:       orders.customer_id = customers.customer_id
-2. orders → order_items:     order_items.order_id = orders.order_id
-3. order_items → products:   products.product_id = order_items.product_id
-4. orders → deliveries:      deliveries.order_id = orders.order_id
-5. orders → invoices:        invoices.order_id = orders.order_id
-6. invoices → payments:      payments.payment_item = invoices.invoice_id AND payments.is_incoming = 1
+                cur.execute("""
+                    SELECT table_name, column_name FROM information_schema.columns
+                    WHERE table_schema='public'
+                    ORDER BY table_name, ordinal_position
+                """)
+                for row in cur.fetchall():
+                    r = dict(row)
+                    t, c = r.get("table_name", ""), r.get("column_name", "")
+                    if t in schema["tables"] and c:
+                        schema["tables"][t].append(c)
 
-UNPAID ORDER DEFINITION (MANDATORY):
-An order is UNPAID if: invoice exists AND (no payment OR payment.amount < invoice.total_amount)
-Use this exact pattern when detecting unpaid orders:
-  SELECT DISTINCT o.order_id, c.name
-  FROM orders o
-  JOIN invoices i ON o.order_id = i.order_id
-  LEFT JOIN payments p ON p.payment_item = i.invoice_id AND p.is_incoming = 1
-  JOIN customers c ON o.customer_id = c.customer_id
-  WHERE i.is_cancelled = 0
-    AND (p.payment_id IS NULL OR p.amount < i.total_amount)
+                cur.execute("""
+                    SELECT tc.table_name, kcu.column_name,
+                           ccu.table_name AS foreign_table, ccu.column_name AS foreign_column
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON ccu.constraint_name = tc.constraint_name
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                """)
+                for row in cur.fetchall():
+                    r = dict(row)
+                    schema["foreign_keys"].append({
+                        "from_table": r.get("table_name", ""),
+                        "from_col":   r.get("column_name", ""),
+                        "to_table":   r.get("foreign_table", ""),
+                        "to_col":     r.get("foreign_column", ""),
+                    })
+        logger.info("[SCHEMA] Loaded %d tables from PostgreSQL", len(schema["tables"]))
+    except Exception as exc:
+        logger.error("[SCHEMA] Failed to load schema: %s", exc)
+        schema["tables"] = {
+            "customers":   ["customer_id", "name", "grouping", "is_blocked", "created_date"],
+            "orders":      ["order_id", "customer_id", "order_date", "total_amount", "delivery_status"],
+            "order_items": ["order_id", "line_no", "product_id", "quantity", "net_amount"],
+            "deliveries":  ["delivery_id", "order_id", "ship_date", "picking_status", "goods_status"],
+            "invoices":    ["invoice_id", "order_id", "customer_id", "invoice_date", "total_amount"],
+            "payments":    ["payment_id", "customer_id", "clearing_date", "amount", "is_incoming"],
+            "products":    ["product_id", "product_name", "product_type", "product_group"],
+        }
+    return schema
 
-CRITICAL ANTI-HALLUCINATION RULES:
-- NO process_status column exists anywhere.
-- NO delivery_status on order_items.
-- ONLY use the exact columns listed above.
-- For unpaid/payment queries, ALWAYS join invoices first.
-"""
 
-STAGE1_PROMPT = """You are a fast intent classifier for a business data system (SAP Order-to-Cash).
-Normalize the user query and extract structured intent.
+# FIX 1: Populate LIVE_SCHEMA at module load time — never empty.
+LIVE_SCHEMA = load_schema_from_db()
 
-Output STRICT JSON only. No explanation. No markdown.
 
-Format:
-{
-  "intent": "list_unpaid_orders" | "trace_order" | "top_products" | "customer_summary" | "count_orders" | "list_invoices" | "list_deliveries" | "list_payments" | "unknown",
-  "normalized_query": "clean version of the query",
-  "entities": {
-    "order_id": null or "string",
-    "customer_id": null or "string",
-    "product": null or "string"
-  }
-}
+def format_schema_for_prompt(schema: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for table, cols in schema.get("tables", {}).items():
+        lines.append(f"TABLE {table} ({', '.join(cols)})")
+    fks = schema.get("foreign_keys", [])
+    if fks:
+        lines.append("\nFOREIGN KEYS:")
+        for fk in fks:
+            lines.append(f"  {fk['from_table']}.{fk['from_col']} -> {fk['to_table']}.{fk['to_col']}")
+    return "\n".join(lines)
 
-Intent mappings (use these EXACTLY):
-- "unpaid orders", "orders not paid", "pending payments", "outstanding invoices" → intent: "list_unpaid_orders"
-- "trace order X", "show order X", "order X status" → intent: "trace_order"
-"""
 
-STAGE2_PROMPT = f"""You are a precise SQLite SQL generator for a business database.
+# ── JSON helpers ──────────────────────────────────────────────────────────────
 
-{DB_SCHEMA}
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj: Any) -> Any:  # pyre-ignore[14]
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
 
-Generate a single valid SQLite SELECT query. Output STRICT JSON only. No explanation. No markdown. No thinking.
 
-Format:
-{{"sql": "SELECT ...", "confidence": "high" | "low"}}
+def safe_serialize(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: safe_serialize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [safe_serialize(i) for i in obj]
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
-Rules:
-- ONLY SELECT statements
-- ONLY use tables/columns listed in the schema
-- For unpaid orders always use the exact join pattern provided
-- Set confidence to "low" if the query cannot be reliably mapped to the schema
-- NEVER return only an ID column — always select rich descriptive columns using `*` or explicit valid columns (e.g., `SELECT o.*, c.name FROM orders o...`).
-- CRITICAL: Do NOT invent column names. Only use the exact columns listed in the schema. Pay close attention to which table a column belongs to.
-"""
 
+# ── Request model ─────────────────────────────────────────────────────────────
 
 class QuestionRequest(BaseModel):
     question: str
 
 
-# ── Stage 1: Groq intent parser ──────────────────────────────────────────────
-def parse_intent(question: str) -> dict:
-    try:
-        from groq import Groq
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": STAGE1_PROMPT},
-                {"role": "user",   "content": question},
-            ],
-            temperature=0.0,
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        logger.error(f"Stage 1 (intent parse) failed: {e}")
-        return {
-            "intent": "unknown",
-            "normalized_query": question.strip().lower(),
-            "entities": {}
-        }
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+# FIX 3: Sentinel object so we can cache None without confusing it with a miss.
+_CACHE_MISS = object()
 
 
-# ── Stage 2: Gemini SQL generator ─────────────────────────────────────────────
-def generate_sql_gemini(normalized: str, intent: str) -> dict:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-            )
-        )
-        prompt = f"Intent: {intent}\nQuery: {normalized}\n\nGenerate the SQL. Output JSON only."
-        result = model.generate_content([STAGE2_PROMPT, prompt])
-        raw = result.text.strip()
-        # Strip any accidental markdown fences
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-        return json.loads(raw)
-    except Exception as e:
-        logger.error(f"Stage 2 Gemini SQL failed: {e}")
-        return {"sql": "", "confidence": "none"}
+class LRUCache:
+    def __init__(self, max_size: int) -> None:
+        self.max_size = max_size
+        self._store: OrderedDict = OrderedDict()  # pyre-ignore[24]
+
+    def get(self, key: str) -> Any:
+        if key not in self._store:
+            return _CACHE_MISS
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = value
+        self._store.move_to_end(key)
+        while len(self._store) > self.max_size:
+            self._store.popitem(last=False)
 
 
-# ── Stage 2 fallback: Groq SQL generator ─────────────────────────────────────
-def generate_sql_groq(normalized: str, intent: str) -> dict:
-    try:
-        from groq import Groq
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": STAGE2_PROMPT},
-                {"role": "user",   "content": f"Intent: {intent}\nQuery: {normalized}"},
-            ],
-            temperature=0.0,
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        logger.error(f"Stage 2 Groq SQL fallback failed: {e}")
-        return {"sql": "", "confidence": "none"}
+_sql_id_cache: Dict[str, str] = {}
+_sql_gen_cache: LRUCache = LRUCache(200)
+_result_cache: LRUCache = LRUCache(200)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+DATASET_KEYWORDS = {
+    "order", "orders", "customer", "customers",
+    "delivery", "deliveries", "invoice", "invoices",
+    "payment", "payments", "product", "products",
+    "revenue", "data", "sales", "billing",
+    "trace", "flow", "highest", "top", "show", "all",
+}
+
+# FIX 2: Prompt now instructs the model to return JSON {"sql": "..."}
+# which matches response_format={"type": "json_object"}.
+SQL_PROMPT_TEMPLATE = """You are a PostgreSQL expert.
+
+Database schema:
+{schema}
+
+Rules:
+- Use ONLY the tables and columns listed above. Do NOT hallucinate.
+- Always use proper JOINs for relationships.
+- No SELECT * — always name columns explicitly.
+- Always alias IDs: o.order_id AS order_id, c.customer_id AS customer_id,
+  d.delivery_id AS delivery_id, i.invoice_id AS invoice_id,
+  p.payment_id AS payment_id, pr.product_id AS product_id
+- Always include LIMIT 20.
+- Return ONLY a JSON object with a single key "sql" containing the SQL query.
+  Example: {{"sql": "SELECT c.customer_id AS customer_id FROM customers c LIMIT 20"}}
+- No explanation, no markdown, no extra keys.
+"""
+
+LLM_RATE_SIGNALS = [
+    "rate_limit", "rate limit", "quota", "429", "401", "403",
+    "api_key", "exceeded", "limit exceeded", "insufficient_quota",
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def is_dataset_question(question: str) -> bool:
+    return any(k in question.lower() for k in DATASET_KEYWORDS)
 
 
-def generate_sql(normalized: str, intent: str) -> dict:
-    """Try Gemini first, fall back to Groq."""
-    result = generate_sql_gemini(normalized, intent)
-    if not result.get("sql") or result.get("confidence") == "none":
-        logger.warning("Gemini SQL failed, falling back to Groq")
-        result = generate_sql_groq(normalized, intent)
-    return result
+def is_llm_rate_error(error_str: str) -> bool:
+    return any(sig in error_str.lower() for sig in LLM_RATE_SIGNALS)
 
 
-# ── SQL Validation ────────────────────────────────────────────────────────────
-def validate_sql(sql: str) -> bool:
-    """Strict safety check: only SELECT, only known tables, no destructive ops."""
+def sanitize_and_validate_sql(sql: str) -> Optional[str]:
     if not sql or not sql.strip():
-        return False
-    lower = sql.lower().strip()
-
-    # Must start with SELECT or WITH (CTE)
+        return None
+    raw = sql.strip().rstrip(";")
+    lower = raw.lower()
     if not (lower.startswith("select") or lower.startswith("with")):
-        return False
-
-    # Block any DML/DDL keywords
-    disallowed = ["drop", "delete", "update", "insert", "alter",
-                  "create", "grant", "revoke", "replace", "truncate"]
-    for w in disallowed:
-        if re.search(r'\b' + w + r'\b', lower):
-            return False
-
-    # Ensure at least one valid table is referenced
-    if not any(t in lower for t in ALLOWED_TABLES):
-        return False
-
-    return True
+        logger.warning("[SQL] Rejected non-SELECT")
+        return None
+    disallowed = ["drop", "delete", "update", "insert", "alter", "truncate", "grant", "revoke", "create"]
+    if any(re.search(r"\b" + w + r"\b", lower) for w in disallowed):
+        logger.warning("[SQL] Rejected unsafe keyword")
+        return None
+    if "limit" not in lower:
+        raw = raw + " LIMIT 20"
+    logger.info("[SQL] Validated: %s", _trunc(raw))
+    return raw
 
 
-# ── Python-based response formatter (no LLM needed) ──────────────────────────
-def format_preview(results: list, entity: str) -> list:
-    preview = []
-    id_field = f"{entity}_id" if entity != "unknown" else "order_id"
-    fallback_keys = ["order_id", "customer_id", "delivery_id",
-                     "invoice_id", "payment_id", "name"]
-    for r in results:
-        if id_field in r:
-            preview.append(r[id_field])
-        else:
-            for k in fallback_keys:
-                if k in r and r[k]:
-                    preview.append(r[k])
-                    break
-            else:
-                preview.append(list(r.values())[0])
-    return preview[:5]
-
-
-def python_format_summary(results: list, title: str, entity: str) -> str:
-    """Build a clean bullet-point summary using Python only — no LLM, no hallucination."""
-    count = len(results)
-    id_field = f"{entity}_id" if entity not in ("unknown", "") else "order_id"
-    fallback_keys = ["order_id", "customer_id", "delivery_id",
-                     "invoice_id", "payment_id", "name"]
-
-    bullets = []
-    for r in results[:10]:
-        label = None
-        if id_field in r:
-            label = str(r[id_field])
-        else:
-            for k in fallback_keys:
-                if k in r and r[k]:
-                    label = str(r[k])
-                    break
-        if label:
-            bullets.append(f"• {entity.capitalize()} {label}")
-
-    lines = [f"Here are the results:\n"]
-    lines += bullets
-    if count > 10:
-        lines.append(f"  … and {count - 10} more")
-    lines.append(f"\nTotal: {count} result{'s' if count != 1 else ''} found.")
+def format_small_result(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "No matching data found."
+    lines: List[str] = [f"Found {len(rows)} result(s):"]
+    for row in itertools.islice(rows, 10):
+        pairs = [f"{k}: {v}" for k, v in row.items()]
+        lines.append(f"- {', '.join(pairs)}")
     return "\n".join(lines)
 
 
-def get_entity_from_intent(intent: str) -> str:
-    mapping = {
-        "list_unpaid_orders": "order",
-        "trace_order": "order",
-        "count_orders": "order",
-        "top_products": "product",
-        "customer_summary": "customer",
-        "list_invoices": "invoice",
-        "list_deliveries": "delivery",
-        "list_payments": "payment",
+def format_preview(rows: List[Dict[str, Any]], entity: str) -> List[str]:
+    preview: List[str] = []
+    id_field = f"{entity}_id"
+    fallback = ["order_id", "customer_id", "delivery_id", "invoice_id", "payment_id", "name"]
+    for row in rows:
+        val = row.get(id_field)
+        if val:
+            preview.append(str(val))
+            continue
+        for key in fallback:
+            if row.get(key):
+                preview.append(str(row[key]))
+                break
+    return list(itertools.islice(preview, 5))
+
+
+def _error_response(msg: str, detail: str = "") -> Dict[str, Any]:
+    return {
+        "type": "error",
+        "error": msg,
+        "summary": detail or msg,
+        "total": 0,
+        "data": [],
+        "graph": {"nodes": [], "edges": []},
     }
-    return mapping.get(intent, "order")
 
 
-def get_title_from_intent(intent: str, normalized: str) -> str:
-    mapping = {
-        "list_unpaid_orders": "Unpaid Orders",
-        "trace_order": "Order Trace",
-        "count_orders": "Order Count",
-        "top_products": "Top Products",
-        "customer_summary": "Customer Summary",
-        "list_invoices": "Invoices",
-        "list_deliveries": "Deliveries",
-        "list_payments": "Payments",
-    }
-    return mapping.get(intent, normalized.title()[:40])
+# ── LLM calls (all blocking — run in thread pool) ────────────────────────────
+
+def _groq_call(question: str, schema_str: str) -> Dict[str, Any]:
+    from groq import Groq  # pyre-ignore[21]
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+    client = Groq(api_key=GROQ_API_KEY)
+    prompt = SQL_PROMPT_TEMPLATE.format(schema=schema_str)
+    resp = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        response_format={"type": "json_object"},
+        temperature=0.0,
+        timeout=10,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": question},
+        ],
+    )
+    content = resp.choices[0].message.content or "{}"
+    return json.loads(content)  # type: ignore[return-value]
 
 
-# ── Pagination endpoint ────────────────────────────────────────────────────────
-@router.get("/{query_id}")
-def load_query_page(query_id: str, page: int = 0, limit: int = 10):
-    from config import DB_PATH
-    if query_id not in sql_cache:
-        return {"error": "Query expired or not found", "full_data": []}
-    base_sql = sql_cache[query_id].rstrip(";")
-    paginated = f"{base_sql} LIMIT {limit} OFFSET {page * limit}"
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def _gemini_call(question: str, sql: str, rows: List[Dict[str, Any]]) -> str:
+    import google.generativeai as genai  # pyre-ignore[21]
+    if not GEMINI_API_KEY:
+        return format_small_result(list(itertools.islice(rows, 10)))
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        generation_config=genai.types.GenerationConfig(temperature=0.1, max_output_tokens=260),  # pyre-ignore[16]
+    )
+    sample = safe_serialize(list(itertools.islice(rows, 20)))
+    prompt = (
+        f"User: {question}\nSQL: {sql}\nRows: {len(rows)}\n"
+        f"Sample:\n{json.dumps(sample)}\n\nWrite a concise business summary."
+    )
+    result = model.generate_content(["Summarize SQL results as a business analyst. Plain text only.", prompt])
+    return (result.text or "").strip() or format_small_result(list(itertools.islice(rows, 10)))
+
+
+def _groq_fallback_summary(question: str, rows: List[Dict[str, Any]]) -> str:
+    """Blocking Groq summary — always called via asyncio.to_thread."""
     try:
-        rows = conn.execute(paginated).fetchall()
-        return {"full_data": [dict(r) for r in rows]}
-    except Exception as e:
-        return {"error": str(e), "full_data": []}
-    finally:
-        conn.close()
+        from groq import Groq  # pyre-ignore[21]
+        client = Groq(api_key=GROQ_API_KEY)
+        sample = safe_serialize(list(itertools.islice(rows, 15)))
+        resp = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            temperature=0.1,
+            max_tokens=200,
+            timeout=10,
+            messages=[
+                {"role": "system", "content": "Summarize SQL results concisely as a business analyst."},
+                {"role": "user", "content": f"Question: {question}\nData: {json.dumps(sample)}"},
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip() or format_small_result(list(itertools.islice(rows, 10)))
+    except Exception as exc:
+        logger.warning("[WARN] Groq fallback summary failed: %s", exc)
+        return format_small_result(list(itertools.islice(rows, 10)))
 
 
-# ── Main query endpoint ────────────────────────────────────────────────────────
-@router.post("/")
-def natural_language_query(body: QuestionRequest):
-    from config import DB_PATH
+# ── Core pipeline ─────────────────────────────────────────────────────────────
 
-    # ── Stage 1: Intent + normalization ──────────────────────────────────────
-    stage1 = parse_intent(body.question)
-    normalized = stage1.get("normalized_query", body.question)
-    intent = stage1.get("intent", "unknown")
-    entities = stage1.get("entities", {})
-    logger.info(f"[Stage 1] Q='{body.question}' → intent='{intent}' normalized='{normalized}'")
+async def generate_sql_from_llm(question: str) -> Optional[str]:
+    cached = _sql_gen_cache.get(question)
+    # FIX 3: Use _CACHE_MISS so None (invalid SQL) is cached and returned correctly.
+    if cached is not _CACHE_MISS:
+        logger.info("[CACHE] SQL cache hit")
+        return cached  # type: ignore[return-value]
 
-    # ── Stage 2: SQL generation (Gemini first, Groq fallback) ────────────────
-    stage2 = generate_sql(normalized, intent)
-    sql = stage2.get("sql", "").strip()
-    confidence = stage2.get("confidence", "none").lower()
-
-    if confidence in ("none", "low") or not sql:
-        logger.warning(f"[Stage 2] Low/no confidence for query: '{body.question}'")
-        return {"type": "error", "answer": "I couldn't find reliable data for this query."}
-
-    if not validate_sql(sql):
-        logger.warning(f"[Stage 2] SQL validation failed: {sql[:120]}")
-        return {"type": "error", "answer": "I couldn't find reliable data for this query."}
-
-    logger.info(f"[Stage 2] SQL → {sql[:120]}")
-
-    # ── Execute SQL ───────────────────────────────────────────────────────────
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    schema_str = format_schema_for_prompt(LIVE_SCHEMA)
     try:
-        rows = conn.execute(sql).fetchall()
-        results = [dict(r) for r in rows]
-    except Exception as e:
-        logger.error(f"[SQL Exec] {e}")
-        return {"type": "error", "answer": "An error occurred while querying the database."}
-    finally:
-        conn.close()
+        logger.info("[GROQ] Generating SQL for: %s", _trunc(question, 60))
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_groq_call, question, schema_str),  # pyre-ignore[6]
+            timeout=12.0,
+        )
+        sql_raw: str = str(result.get("sql", "")).strip()
+        logger.info("[GROQ] Raw SQL: %s", _trunc(sql_raw))
+    except asyncio.TimeoutError:
+        raise ValueError("LLM timeout — Groq did not respond within 10 seconds")
+    except Exception as exc:
+        if is_llm_rate_error(str(exc)):
+            raise ValueError("LLM limit exceeded")
+        logger.warning("[GROQ] Error: %s", exc)
+        return None
 
-    if not results:
-        logger.info("[SQL Exec] 0 rows returned")
-        return {"type": "error", "answer": "No matching data found for your query."}
+    sql = sanitize_and_validate_sql(sql_raw)
+    _sql_gen_cache.set(question, sql)
+    return sql
 
-    logger.info(f"[SQL Exec] {len(results)} rows returned")
 
-    # ── Format response (Python-only, no hallucination) ───────────────────────
-    entity = get_entity_from_intent(intent)
-    title  = get_title_from_intent(intent, normalized)
-    summary = python_format_summary(results, title, entity)
-    preview = format_preview(results, entity)
+async def run_sql(sql: str) -> Any:
+    cached = _result_cache.get(sql)
+    if cached is not _CACHE_MISS:
+        logger.info("[CACHE] Result cache hit")
+        return cached
 
-    # Cache SQL for pagination — keyed by new UUID every request (no stale cache)
+    try:
+        logger.info("[DB] Executing SQL…")
+        rows = await asyncio.to_thread(fetch_all, sql)  # pyre-ignore[6]
+        logger.info("[DB] Got %d rows", len(rows))  # pyre-ignore[6]
+        result = safe_serialize(list(rows))
+        _result_cache.set(sql, result)
+        return result
+    except Exception as exc:
+        logger.error("[DB] Query failed: %s", exc)
+        return {"error": "Database error", "details": str(exc)}
+
+
+async def summarize(question: str, sql: str, rows: List[Dict[str, Any]]) -> str:
+    if len(rows) < 10:
+        return format_small_result(rows)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_gemini_call, question, sql, rows),  # pyre-ignore[6]
+            timeout=12.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[GEMINI] Timeout — Groq fallback")
+        # FIX 5: Run blocking fallback in thread pool.
+        return await asyncio.to_thread(_groq_fallback_summary, question, rows)  # pyre-ignore[6]
+    except Exception as exc:
+        if is_llm_rate_error(str(exc)):
+            logger.info("[GEMINI] Quota exceeded — Groq fallback")
+            return await asyncio.to_thread(_groq_fallback_summary, question, rows)  # pyre-ignore[6]
+        logger.warning("[GEMINI] Error: %s", exc)
+        return format_small_result(rows)
+
+
+async def build_query_response(question: str) -> Dict[str, Any]:
+    """Steps 1-13: Full pipeline."""
+    logger.info("[REQUEST] %s", _trunc(question, 80))
+
+    if not is_dataset_question(question):
+        return _error_response("This system only answers dataset-related queries.")
+
+    try:
+        sql = await generate_sql_from_llm(question)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    except Exception as exc:
+        return _error_response("SQL generation failed", str(exc))
+
+    if not sql:
+        return _error_response("Could not generate valid SQL for this query.")
+
+    db_result = await run_sql(sql)
+    if isinstance(db_result, dict) and "error" in db_result:
+        return _error_response(db_result["error"], db_result.get("details", ""))
+
+    rows: List[Dict[str, Any]] = db_result  # type: ignore[assignment]
+
+    # FIX 4: Guard for empty rows BEFORE calling graph_builder.
+    if not rows:
+        return {
+            "type": "graph",
+            "summary": "No matching data found.",
+            "total": 0,
+            "data": [],
+            "graph": {"nodes": [], "edges": []},
+        }
+
+    # Step 6: Graph builder (only when rows is non-empty)
+    graph_data: Dict[str, Any] = graph_builder.build_graph(rows)
+
+    entity = "order"
+    q_lower = question.lower()
+    for kw, ent in [("customer", "customer"), ("delivery", "delivery"),
+                    ("invoice", "invoice"), ("payment", "payment"), ("product", "product")]:
+        if kw in q_lower:
+            entity = ent
+            break
+
+    summary_text = await summarize(question, sql, rows)
     query_id = str(uuid.uuid4())
-    sql_cache[query_id] = sql.rstrip(";")
+    _sql_id_cache[query_id] = sql
+
+    logger.info("[OK] %d rows | %d nodes | %d edges",
+                len(rows), len(graph_data["nodes"]), len(graph_data["edges"]))
 
     return {
-        "type": "list",
-        "title": title,
-        "summary": summary,
-        "total": len(results),
-        "preview": preview,
-        "full_data": results,
+        "type": "graph",
+        "title": "Query Results",
+        "summary": summary_text,
+        "total": len(rows),
+        "preview": format_preview(rows, entity),
+        "data": list(itertools.islice(rows, 100)),
+        "graph": graph_data,
         "query_id": query_id,
         "entity": entity,
-        "intent": intent,
-        "entities": entities,
     }
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get("/{query_id}")
+async def load_page(query_id: str, page: int = 0, limit: int = 10) -> Any:
+    if query_id not in _sql_id_cache:
+        return {"error": "Not found", "full_data": []}
+    base_sql = _sql_id_cache[query_id].rstrip(";")
+    offset = max(0, page) * max(1, limit)
+    paginated = f"{base_sql} LIMIT {limit} OFFSET {offset}"
+    try:
+        rows = await asyncio.to_thread(fetch_all, paginated)  # pyre-ignore[6]
+        return {"full_data": safe_serialize(list(rows))}
+    except Exception as exc:
+        return {"error": str(exc), "full_data": []}
+
+
+@router.post("/")
+async def natural_language_query(body: QuestionRequest) -> Any:
+    logger.info("[API] POST /query — %s", _trunc(body.question, 60))
+    try:
+        result = await build_query_response(body.question.strip())
+    except Exception as exc:
+        logger.error("[API] Unhandled error: %s", exc, exc_info=True)
+        if is_llm_rate_error(str(exc)):
+            return JSONResponse(content=_error_response("LLM limit exceeded"), status_code=200)
+        return JSONResponse(content=_error_response("Internal error", str(exc)), status_code=200)
+    return JSONResponse(content=result, status_code=200)
+
+
+@router.post("/stream")
+async def stream_query(body: QuestionRequest) -> Any:
+    question = body.question.strip()
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        yield "event: status\ndata: Processing...\n\n"
+        try:
+            payload = await build_query_response(question)
+            yield f"event: result\ndata: {json.dumps(payload, cls=CustomJSONEncoder)}\n\n"
+        except Exception as exc:
+            yield f"event: result\ndata: {json.dumps(_error_response('Internal error', str(exc)))}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

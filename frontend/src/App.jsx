@@ -1,11 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import GraphView from './components/GraphView';
 import Chat from './components/Chat';
 import { Moon, Sun } from 'lucide-react';
 import './App.css';
 
 export default function App() {
+  const MIN_PANE_WIDTH = 300;
+  const DEFAULT_SPLIT_PERCENT = 65;
   const [graphHighlight, setGraphHighlight] = useState(null);
+  const [leftPaneWidth, setLeftPaneWidth] = useState(() => {
+    const saved = sessionStorage.getItem('split-left-width');
+    return saved ? Number(saved) : null;
+  });
+  const [isDragging, setIsDragging] = useState(false);
+  const appBodyRef = useRef(null);
 
   // Initialize theme from localStorage or default to 'dark'
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'dark');
@@ -27,6 +35,48 @@ export default function App() {
       setGraphHighlight([entities.order_id]);
     }
   };
+
+  useEffect(() => {
+    if (typeof leftPaneWidth === 'number') {
+      sessionStorage.setItem('split-left-width', String(leftPaneWidth));
+    }
+  }, [leftPaneWidth]);
+
+  useEffect(() => {
+    if (typeof leftPaneWidth === 'number') return;
+    const bodyEl = appBodyRef.current;
+    if (!bodyEl) return;
+    const defaultWidth = Math.round((bodyEl.clientWidth * DEFAULT_SPLIT_PERCENT) / 100);
+    setLeftPaneWidth(defaultWidth);
+  }, [leftPaneWidth]);
+
+  useEffect(() => {
+    if (!isDragging) return undefined;
+
+    const onMouseMove = (e) => {
+      const bodyEl = appBodyRef.current;
+      if (!bodyEl) return;
+      const rect = bodyEl.getBoundingClientRect();
+      const minLeft = MIN_PANE_WIDTH;
+      const maxLeft = rect.width - MIN_PANE_WIDTH;
+      const next = Math.min(Math.max(e.clientX - rect.left, minLeft), maxLeft);
+      setLeftPaneWidth(next);
+    };
+
+    const onMouseUp = () => {
+      setIsDragging(false);
+    };
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    document.body.classList.add('is-resizing');
+
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.body.classList.remove('is-resizing');
+    };
+  }, [isDragging]);
 
   return (
     <div className="app">
@@ -61,10 +111,20 @@ export default function App() {
         </button>
       </header>
 
-      <main className="app-body">
-        <div className="pane pane-graph">
+      <main className="app-body" ref={appBodyRef}>
+        <div
+          className="pane pane-graph"
+          style={leftPaneWidth ? { width: `${leftPaneWidth}px`, flex: '0 0 auto' } : undefined}
+        >
           <GraphView externalOrderQuery={graphHighlight} onClearExternal={() => setGraphHighlight(null)} />
         </div>
+        <div
+          className="splitter"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize panels"
+          onMouseDown={() => setIsDragging(true)}
+        />
         <div className="pane pane-chat">
           <Chat onEntityDetect={handleEntityDetect} />
         </div>

@@ -1,10 +1,17 @@
 import os
+from dotenv import load_dotenv
+
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.join(
     os.path.dirname(__file__), "..", "data", "sap-o2c-data"
 )
 DB_PATH = os.path.join(os.path.dirname(__file__), "sap_o2c.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # ── JSONL folder names ────────────────────────────────────────────────────────
 FOLDERS = {

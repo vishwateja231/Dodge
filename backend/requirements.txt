@@ -4,3 +4,5 @@ uvicorn[standard]>=0.27
 google-generativeai>=0.5
 python-dotenv>=1.0
 groq>=0.9
+psycopg[binary]>=3.2
+psycopg-pool>=3.2

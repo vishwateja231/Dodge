@@ -21,6 +21,7 @@ const NODE_COLORS = {
     Delivery: '#06b6d4', // cyan
     Invoice: '#f59e0b', // amber
     Payment: '#10b981', // emerald
+    Product: '#ec4899', // pink
 };
 
 // Detect current body theme ('dark' | 'light')
@@ -212,16 +213,59 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
 
     useEffect(() => {
         if (externalOrderQuery) {
-            if (Array.isArray(externalOrderQuery)) {
+            if (externalOrderQuery.nodes && externalOrderQuery.edges) {
+                // Render graph data directly
+                setLoading(true);
+                const styledNodes = externalOrderQuery.nodes.map(n => {
+                    const bg = NODE_COLORS[n.metadata.type] || '#888';
+                    return {
+                        ...n,
+                        style: {
+                            background: bg,
+                            color: '#ffffff',
+                            border: isDark ? 'none' : '1px solid rgba(0,0,0,0.08)',
+                            borderRadius: '12px',
+                            padding: '16px 20px',
+                            fontSize: '14px',
+                            fontWeight: '600',
+                            boxShadow: isDark ? '0 8px 24px rgba(0,0,0,0.5)' : '0 4px 12px rgba(0,0,0,0.12)',
+                            width: 180,
+                            textAlign: 'center'
+                        }
+                    };
+                });
+                const styledEdges = externalOrderQuery.edges.map(e => ({
+                    ...e,
+                    type: 'smoothstep',
+                    animated: true,
+                    style: {
+                        stroke: isDark ? 'rgba(255,255,255,0.2)' : '#000000',
+                        strokeWidth: 2
+                    },
+                    labelStyle: {
+                        fill: isDark ? '#a1a1aa' : '#000000',
+                        fontSize: 12,
+                        fontWeight: isDark ? '400' : '600'
+                    },
+                    markerEnd: {
+                        type: MarkerType.ArrowClosed,
+                        color: isDark ? 'rgba(255,255,255,0.4)' : '#000000'
+                    }
+                }));
+                applyForceLayout(styledNodes, styledEdges);
+                setLoading(false);
+                if (onClearExternal) onClearExternal();
+            } else if (Array.isArray(externalOrderQuery)) {
                 setOrderQuery(externalOrderQuery.join(", "));
                 loadFlow(null, externalOrderQuery);
+                if (onClearExternal) onClearExternal();
             } else {
                 setOrderQuery(externalOrderQuery);
                 loadFlow(externalOrderQuery);
+                if (onClearExternal) onClearExternal();
             }
-            if (onClearExternal) onClearExternal();
         }
-    }, [externalOrderQuery, loadFlow, onClearExternal]);
+    }, [externalOrderQuery, loadFlow, onClearExternal, applyForceLayout, isDark]);
 
     // Force re-render of existing nodes/edges when theme flips
     useEffect(() => {

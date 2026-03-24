@@ -131,12 +131,43 @@ body.light .app-header {
 .pane-graph {
   flex: 0 0 65%;
   position: relative;
+  min-width: 300px;
 }
 
 .pane-chat {
   flex: 1;
-  border-left: 1px solid var(--border);
+  min-width: 300px;
   background: var(--bg);
+}
+
+.splitter {
+  width: 8px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+  flex: 0 0 8px;
+}
+
+.splitter::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border);
+}
+
+.splitter:hover::before,
+body.is-resizing .splitter::before {
+  background: var(--brand);
+}
+
+body.is-resizing {
+  user-select: none;
+  cursor: col-resize;
 }
 
 /* ── Network Graph ──────────────────────────────────────────── */
