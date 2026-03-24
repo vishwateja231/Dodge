@@ -18,11 +18,10 @@ import itertools
 import json
 import logging
 import re
-import uuid
 from collections import OrderedDict
 from decimal import Decimal
 from datetime import date, datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter  # pyre-ignore[21]
 from fastapi.responses import StreamingResponse, JSONResponse  # pyre-ignore[21]
@@ -182,7 +181,6 @@ class LRUCache:
             self._store.popitem(last=False)
 
 
-_sql_id_cache: Dict[str, str] = {}
 _sql_gen_cache: LRUCache = LRUCache(200)
 _result_cache: LRUCache = LRUCache(200)
 
@@ -259,31 +257,99 @@ def format_small_result(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def format_preview(rows: List[Dict[str, Any]], entity: str) -> List[str]:
-    preview: List[str] = []
-    id_field = f"{entity}_id"
-    fallback = ["order_id", "customer_id", "delivery_id", "invoice_id", "payment_id", "name"]
-    for row in rows:
-        val = row.get(id_field)
-        if val:
-            preview.append(str(val))
-            continue
-        for key in fallback:
-            if row.get(key):
-                preview.append(str(row[key]))
-                break
-    return list(itertools.islice(preview, 5))
+def build_overview(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"row_count": 0}
+    first = rows[0]
+    overview: Dict[str, Any] = {
+        "row_count": len(rows),
+        "columns": list(itertools.islice(first.keys(), 10)),
+    }
+    for key in ("customer_id", "order_id", "delivery_id", "invoice_id", "payment_id", "product_id"):
+        values = [r.get(key) for r in rows if r.get(key) not in (None, "")]
+        if values:
+            overview[f"unique_{key}"] = len(set(values))
+    return overview
 
 
 def _error_response(msg: str, detail: str = "") -> Dict[str, Any]:
     return {
         "type": "error",
-        "error": msg,
-        "summary": detail or msg,
-        "total": 0,
-        "data": [],
-        "graph": {"nodes": [], "edges": []},
+        "message": detail or msg,
     }
+
+
+def _empty_response(message: str = "No data found") -> Dict[str, Any]:
+    return {"type": "empty", "message": message}
+
+
+def normalize_question(question: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Extract query IDs and normalize the prompt for stronger SQL generation.
+    Example:
+    'show customer 320000083 orders' -> includes guardrail: use orders.customer.
+    """
+    cleaned = re.sub(r"\s+", " ", question).strip()
+    hints: Dict[str, str] = {}
+
+    customer_match = re.search(r"\bcustomer\s+([A-Za-z0-9_-]+)\b", cleaned, flags=re.IGNORECASE)
+    if customer_match:
+        hints["customer"] = customer_match.group(1)
+
+    order_match = re.search(r"\border\s+([A-Za-z0-9_-]+)\b", cleaned, flags=re.IGNORECASE)
+    if order_match:
+        hints["order"] = order_match.group(1)
+
+    if hints.get("customer"):
+        cleaned += (
+            f"\n\nSQL constraint: when filtering orders by customer, "
+            f"use `orders.customer = '{hints['customer']}'` (not customer_id)."
+        )
+    return cleaned, hints
+
+
+def _extract_known_columns(sql: str) -> Set[str]:
+    tokens = re.findall(r"\b([a-z_][a-z0-9_]*)\b", sql.lower())
+    reserved = {
+        "select", "from", "join", "left", "right", "inner", "outer", "on", "where", "and", "or", "as",
+        "with", "limit", "offset", "group", "by", "order", "desc", "asc", "count", "sum", "avg", "min",
+        "max", "distinct", "case", "when", "then", "else", "end", "not", "null", "is", "having", "true",
+        "false", "in", "like", "ilike", "coalesce",
+    }
+    return {t for t in tokens if t not in reserved and not t.isdigit()}
+
+
+def validate_sql_against_schema(sql: str, schema: Dict[str, Any]) -> Optional[str]:
+    """
+    Reject invalid table/column references and duplicate aliases for *_id columns.
+    """
+    tables = schema.get("tables", {})
+    valid_tables = set(tables.keys())
+    valid_columns = {c for cols in tables.values() for c in cols}
+    tokens = _extract_known_columns(sql)
+
+    # Unknown tokens are tolerated if they are aliases/functions, but unknown identifier ratio
+    # should remain low to catch hallucinations.
+    unknown = [t for t in tokens if t not in valid_tables and t not in valid_columns]
+    if len(unknown) > max(5, int(len(tokens) * 0.45)):
+        logger.warning(
+            "[SQL] Too many unknown identifiers: %s",
+            list(itertools.islice(unknown, 8)),
+        )
+        return None
+
+    aliases = re.findall(r"\bas\s+([a-z_][a-z0-9_]*)\b", sql.lower())
+    id_aliases = [a for a in aliases if a.endswith("_id")]
+    if len(id_aliases) != len(set(id_aliases)):
+        logger.warning("[SQL] Duplicate *_id aliases are not allowed")
+        return None
+
+    required_aliases = {"customer_id", "order_id", "delivery_id", "invoice_id", "payment_id", "product_id"}
+    bad_aliases = [a for a in id_aliases if a not in required_aliases]
+    if bad_aliases:
+        logger.warning("[SQL] Invalid ID aliases found: %s", bad_aliases)
+        return None
+    return sql
 
 
 # ── LLM calls (all blocking — run in thread pool) ────────────────────────────
@@ -357,11 +423,12 @@ async def generate_sql_from_llm(question: str) -> Optional[str]:
         logger.info("[CACHE] SQL cache hit")
         return cached  # type: ignore[return-value]
 
+    normalized_question, _ = normalize_question(question)
     schema_str = format_schema_for_prompt(LIVE_SCHEMA)
     try:
         logger.info("[GROQ] Generating SQL for: %s", _trunc(question, 60))
         result = await asyncio.wait_for(
-            asyncio.to_thread(_groq_call, question, schema_str),  # pyre-ignore[6]
+            asyncio.to_thread(_groq_call, normalized_question, schema_str),  # pyre-ignore[6]
             timeout=12.0,
         )
         sql_raw: str = str(result.get("sql", "")).strip()
@@ -375,6 +442,8 @@ async def generate_sql_from_llm(question: str) -> Optional[str]:
         return None
 
     sql = sanitize_and_validate_sql(sql_raw)
+    if sql:
+        sql = validate_sql_against_schema(sql, LIVE_SCHEMA)
     _sql_gen_cache.set(question, sql)
     return sql
 
@@ -442,60 +511,27 @@ async def build_query_response(question: str) -> Dict[str, Any]:
 
     # FIX 4: Guard for empty rows BEFORE calling graph_builder.
     if not rows:
-        return {
-            "type": "graph",
-            "summary": "No matching data found.",
-            "total": 0,
-            "data": [],
-            "graph": {"nodes": [], "edges": []},
-        }
+        return _empty_response("No data found")
 
     # Step 6: Graph builder (only when rows is non-empty)
     graph_data: Dict[str, Any] = graph_builder.build_graph(rows)
 
-    entity = "order"
-    q_lower = question.lower()
-    for kw, ent in [("customer", "customer"), ("delivery", "delivery"),
-                    ("invoice", "invoice"), ("payment", "payment"), ("product", "product")]:
-        if kw in q_lower:
-            entity = ent
-            break
-
-    summary_text = await summarize(question, sql, rows)
-    query_id = str(uuid.uuid4())
-    _sql_id_cache[query_id] = sql
+    overview = build_overview(rows)
+    summary_text = f"Query executed successfully. Returned {len(rows)} row(s)."
 
     logger.info("[OK] %d rows | %d nodes | %d edges",
                 len(rows), len(graph_data["nodes"]), len(graph_data["edges"]))
 
     return {
         "type": "graph",
-        "title": "Query Results",
         "summary": summary_text,
-        "total": len(rows),
-        "preview": format_preview(rows, entity),
-        "data": list(itertools.islice(rows, 100)),
+        "overview": overview,
+        "data": list(itertools.islice(rows, 50)),
         "graph": graph_data,
-        "query_id": query_id,
-        "entity": entity,
     }
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.get("/{query_id}")
-async def load_page(query_id: str, page: int = 0, limit: int = 10) -> Any:
-    if query_id not in _sql_id_cache:
-        return {"error": "Not found", "full_data": []}
-    base_sql = _sql_id_cache[query_id].rstrip(";")
-    offset = max(0, page) * max(1, limit)
-    paginated = f"{base_sql} LIMIT {limit} OFFSET {offset}"
-    try:
-        rows = await asyncio.to_thread(fetch_all, paginated)  # pyre-ignore[6]
-        return {"full_data": safe_serialize(list(rows))}
-    except Exception as exc:
-        return {"error": str(exc), "full_data": []}
-
 
 @router.post("/")
 async def natural_language_query(body: QuestionRequest) -> Any:

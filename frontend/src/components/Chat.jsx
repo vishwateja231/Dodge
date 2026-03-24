@@ -3,48 +3,32 @@ import { sendQuery, sendQueryStream } from '../services/api';
 import { Loader2, Send } from 'lucide-react';
 import TableView from './TableView';
 
-// Sub-component for rendering AI list messages with internal toggle state
-const ListMessage = ({ p, msgId, onEntityDetect }) => {
-    // Default table to open so user sees data immediately
+const GraphMessage = ({ payload, onEntityDetect }) => {
     const [showTable, setShowTable] = useState(true);
-
-    const handleShowInGraph = () => {
-        if (onEntityDetect) {
-            if (p.entities && p.entities.order_id) {
-                onEntityDetect(p.entities);
-            } else if (p.full_data && p.full_data.length > 0) {
-                // Extract first-column values as IDs for graph
-                const ids = p.full_data.map(r => Object.values(r)[0]).filter(Boolean);
-                onEntityDetect(ids);
-            }
-        }
-    };
+    const overview = payload.overview || {};
+    const overviewItems = Object.entries(overview).filter(([k]) => k !== 'columns');
 
     return (
         <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {/* Header: title + count */}
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
-                <span style={{ fontWeight: '700', fontSize: '15px', color: 'var(--text)' }}>{p.title}</span>
-                <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{p.total} result{p.total !== 1 ? 's' : ''} found</span>
+            <div style={{ fontWeight: 600 }}>API Overview</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {overviewItems.map(([k, v]) => (
+                    <span key={k} style={{ fontSize: '12px', background: 'var(--surface-hover)', padding: '4px 8px', borderRadius: '6px' }}>
+                        {k.replace(/_/g, ' ')}: {String(v)}
+                    </span>
+                ))}
             </div>
+            <div style={{ whiteSpace: 'pre-wrap', color: 'var(--text-muted)' }}>{payload.summary || 'Query completed.'}</div>
 
-            {/* Data table — shown by default */}
-            {p.full_data && p.full_data.length > 0 && (
-                <TableView data={p.full_data} />
+            {showTable && payload.data && payload.data.length > 0 && (
+                <TableView data={payload.data} />
             )}
 
-            {/* Action buttons */}
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button
-                    className="modern-btn"
-                    onClick={() => setShowTable(!showTable)}
-                >
+                <button className="modern-btn" onClick={() => setShowTable(!showTable)}>
                     {showTable ? 'Collapse Table' : 'Expand Table'}
                 </button>
-                <button
-                    className="modern-btn primary"
-                    onClick={handleShowInGraph}
-                >
+                <button className="modern-btn primary" onClick={() => onEntityDetect?.(payload.graph)}>
                     Show in Graph
                 </button>
             </div>
@@ -64,6 +48,7 @@ export default function Chat({ onEntityDetect }) {
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [loadingText, setLoadingText] = useState('Processing...');
+    const [popup, setPopup] = useState(null);
 
     const scrollRef = useRef(null);
     const inputRef = useRef(null);
@@ -101,35 +86,35 @@ export default function Chat({ onEntityDetect }) {
                 data = await sendQuery(text);
             }
 
-            if (data.type === 'error' || data.error) {
-                const errorMsg = data.error || data.answer || "Internal error";
-                if (errorMsg.includes("LLM limit exceeded")) {
-                    alert("LLM limit reached. Please try again later.");
-                }
-                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: errorMsg }]);
-            }
-            else if (data.type === 'list' || data.type === 'graph') {
+            if (data.type === 'graph') {
                 setMessages((prev) => [...prev, {
                     id: Date.now().toString(),
                     role: 'ai',
-                    type: 'list',
+                    type: 'graph',
                     content: data
                 }]);
-            }
-            else {
-                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: data.answer || "No matching data found." }]);
-            }
-
-            if ((data.type === 'list' || data.type === 'graph') && onEntityDetect) {
-                if (data.graph && (data.graph.nodes?.length > 0)) {
+                if (onEntityDetect && data.graph?.nodes?.length > 0) {
                     onEntityDetect(data.graph);
-                } else if (data.intent === 'trace_order' || data.entities?.order_id) {
-                    onEntityDetect(data.entities);
                 }
+            } else if (data.type === 'empty') {
+                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: data.message || 'No data found' }]);
+            } else {
+                const errorMsg = data.message || data.error || 'Internal error';
+                if (/limit exceeded|quota|rate/i.test(errorMsg)) {
+                    setPopup('LLM API limit exceeded. Please try again later.');
+                    setTimeout(() => setPopup(null), 4000);
+                }
+                setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: errorMsg }]);
             }
-
         } catch (err) {
-            setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: "Internal connection error. Please try again." }]);
+            const message = err?.name === 'AbortError'
+                ? 'Request timed out. Please try again.'
+                : 'Internal connection error. Please try again.';
+            if (/timeout|connection|network/i.test(message)) {
+                setPopup(message);
+                setTimeout(() => setPopup(null), 3000);
+            }
+            setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'ai', type: 'text', content: message }]);
         } finally {
             setLoading(false);
             setLoadingText('Processing...');
@@ -192,13 +177,28 @@ export default function Chat({ onEntityDetect }) {
                                 border: !isUser ? '1px solid var(--border)' : 'none'
                             }}>
                                 {msg.type === 'text' && <div>{msg.content}</div>}
-                                {msg.type === 'list' && (
-                                    <ListMessage p={msg.content} msgId={msg.id} onEntityDetect={onEntityDetect} />
+                                {msg.type === 'graph' && (
+                                    <GraphMessage payload={msg.content} onEntityDetect={onEntityDetect} />
                                 )}
                             </div>
                         </div>
                     );
                 })}
+                {popup && (
+                    <div style={{
+                        position: 'fixed',
+                        top: 80,
+                        right: 20,
+                        background: '#ef4444',
+                        color: '#fff',
+                        padding: '10px 14px',
+                        borderRadius: '8px',
+                        zIndex: 9999,
+                        fontSize: '13px'
+                    }}>
+                        {popup}
+                    </div>
+                )}
 
                 {loading && (
                     <div style={{ display: 'flex', width: '100%', justifyContent: 'flex-start' }}>
