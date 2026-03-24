@@ -141,63 +141,65 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
             };
 
             validResults.forEach(data => {
-                const row = data[0];
+                if (!Array.isArray(data)) data = [data]; // safety
+                data.forEach(row => {
 
-                // 1. Customer
-                if (row.customer_name) {
-                    addNode(`cust-${row.customer_id}`, 'Customer', row.customer_name, { name: row.customer_name });
-                }
-
-                // 2. Order
-                addNode(`ord-${row.order_id}`, 'Order', `Order #${row.order_id}`, {
-                    id: row.order_id,
-                    amount: `${row.order_amount} ₹`,
-                    status: row.delivery_status
-                });
-                if (row.customer_name) addEdge(`cust-${row.customer_id}`, `ord-${row.order_id}`, 'placed');
-
-                // 3. Delivery
-                if (row.delivery_id) {
-                    let label = `Delivery #${row.delivery_id}`;
-                    if (row.goods_status === 'C') label += ' ✅';
-                    addNode(`del-${row.delivery_id}`, 'Delivery', label, {
-                        id: row.delivery_id,
-                        ship_date: row.ship_date,
-                        status: row.goods_status
-                    });
-                    addEdge(`ord-${row.order_id}`, `del-${row.delivery_id}`, 'fulfilled by');
-                }
-
-                // 4. Invoice
-                if (row.invoice_id) {
-                    const label = `Invoice #${row.invoice_id}`;
-                    addNode(`inv-${row.invoice_id}`, 'Invoice', label, {
-                        id: row.invoice_id,
-                        amount: `${row.invoice_amount} ₹`,
-                        date: row.invoice_date,
-                        cancelled: row.is_cancelled === 1 ? 'Yes' : 'No'
-                    });
-                    if (row.delivery_id) addEdge(`del-${row.delivery_id}`, `inv-${row.invoice_id}`, 'billed via');
-                    else addEdge(`ord-${row.order_id}`, `inv-${row.invoice_id}`, 'billed via');
-                }
-
-                // 5. Payment UI Status Logic
-                if (row.invoice_id) {
-                    const payId = `pay-${row.invoice_id}`;
-                    if (row.payment_id) {
-                        addNode(payId, 'Payment', `Paid ✅`, {
-                            id: row.payment_id,
-                            amount: `${row.payment_amount} ₹`,
-                            date: row.clearing_date,
-                            status: 'Paid'
-                        }, '#10b981');
-                    } else if (row.is_cancelled === 1) {
-                        addNode(payId, 'Payment', 'Cancelled ⚠️', { status: 'Invoice Cancelled' }, '#6b7280');
-                    } else {
-                        addNode(payId, 'Payment', 'Unpaid ❌', { status: 'Unpaid / Pending' }, '#ef4444');
+                    // 1. Customer
+                    if (row.customer_name) {
+                        addNode(`cust-${row.customer_id}`, 'Customer', row.customer_name, { name: row.customer_name });
                     }
-                    addEdge(`inv-${row.invoice_id}`, payId, row.payment_id ? 'payment received' : (row.is_cancelled ? 'halted' : 'awaiting payment'));
-                }
+
+                    // 2. Order
+                    addNode(`ord-${row.order_id}`, 'Order', `Order #${row.order_id}`, {
+                        id: row.order_id,
+                        amount: `${row.order_amount} ₹`,
+                        status: row.delivery_status
+                    });
+                    if (row.customer_name) addEdge(`cust-${row.customer_id}`, `ord-${row.order_id}`, 'placed');
+
+                    // 3. Delivery
+                    if (row.delivery_id) {
+                        let label = `Delivery #${row.delivery_id}`;
+                        if (row.goods_status === 'C') label += ' ✅';
+                        addNode(`del-${row.delivery_id}`, 'Delivery', label, {
+                            id: row.delivery_id,
+                            ship_date: row.ship_date,
+                            status: row.goods_status
+                        });
+                        addEdge(`ord-${row.order_id}`, `del-${row.delivery_id}`, 'fulfilled by');
+                    }
+
+                    // 4. Invoice
+                    if (row.invoice_id) {
+                        const label = `Invoice #${row.invoice_id}`;
+                        addNode(`inv-${row.invoice_id}`, 'Invoice', label, {
+                            id: row.invoice_id,
+                            amount: `${row.invoice_amount} ₹`,
+                            date: row.invoice_date,
+                            cancelled: row.is_cancelled === 1 ? 'Yes' : 'No'
+                        });
+                        if (row.delivery_id) addEdge(`del-${row.delivery_id}`, `inv-${row.invoice_id}`, 'billed via');
+                        else addEdge(`ord-${row.order_id}`, `inv-${row.invoice_id}`, 'billed via');
+                    }
+
+                    // 5. Payment UI Status Logic
+                    if (row.invoice_id) {
+                        const payId = `pay-${row.invoice_id}`;
+                        if (row.payment_id) {
+                            addNode(payId, 'Payment', `Paid ✅`, {
+                                id: row.payment_id,
+                                amount: `${row.payment_amount} ₹`,
+                                date: row.clearing_date,
+                                status: 'Paid'
+                            }, '#10b981');
+                        } else if (row.is_cancelled === 1) {
+                            addNode(payId, 'Payment', 'Cancelled ⚠️', { status: 'Invoice Cancelled' }, '#6b7280');
+                        } else {
+                            addNode(payId, 'Payment', 'Unpaid ❌', { status: 'Unpaid / Pending' }, '#ef4444');
+                        }
+                        addEdge(`inv-${row.invoice_id}`, payId, row.payment_id ? 'payment received' : (row.is_cancelled ? 'halted' : 'awaiting payment'));
+                    }
+                });
             });
 
             applyForceLayout(Array.from(uniqueNodes.values()), Array.from(uniqueEdges.values()));

@@ -71,6 +71,7 @@ def order_flow(order_id: str):
     sql = """
     SELECT
         o.order_id,
+        o.customer_id,
         c.name                  AS customer_name,
         o.total_amount          AS order_amount,
         o.delivery_status,

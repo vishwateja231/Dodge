@@ -12,10 +12,13 @@ const ListMessage = ({ p, msgId, onEntityDetect }) => {
         if (onEntityDetect) {
             if (p.entities && p.entities.order_id) {
                 onEntityDetect(p.entities);
-            } else if (p.full_data && p.full_data.length > 0) {
-                // Extract first-column values as IDs for graph
-                const ids = p.full_data.map(r => Object.values(r)[0]).filter(Boolean);
-                onEntityDetect(ids);
+            } else {
+                const arr = p.full_data?.length ? p.full_data : p.data;
+                if (arr && arr.length > 0) {
+                    // Extract first-column values as IDs for graph
+                    const ids = arr.map(r => Object.values(r)[0]).filter(Boolean);
+                    onEntityDetect(ids);
+                }
             }
         }
     };
@@ -29,8 +32,8 @@ const ListMessage = ({ p, msgId, onEntityDetect }) => {
             </div>
 
             {/* Data table — shown by default */}
-            {p.full_data && p.full_data.length > 0 && (
-                <TableView data={p.full_data} />
+            {(p.full_data?.length > 0 || p.data?.length > 0) && (
+                <TableView data={p.full_data?.length ? p.full_data : p.data} />
             )}
 
             {/* Action buttons */}

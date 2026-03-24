@@ -29,7 +29,9 @@ export default function App() {
   };
 
   const handleEntityDetect = (entities) => {
-    if (Array.isArray(entities)) {
+    if (entities && entities.nodes && entities.edges) {
+      setGraphHighlight(entities);
+    } else if (Array.isArray(entities)) {
       setGraphHighlight(entities);
     } else if (entities && entities.order_id) {
       setGraphHighlight([entities.order_id]);
