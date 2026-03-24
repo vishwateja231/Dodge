@@ -16,12 +16,12 @@ import * as d3 from 'd3-force';
 
 // Node colors — same hues, visible on both dark and light backgrounds
 const NODE_COLORS = {
-    Customer: '#7c3aed', // purple
-    Order: '#2563eb', // blue
-    Delivery: '#06b6d4', // cyan
-    Invoice: '#f59e0b', // amber
-    Payment: '#10b981', // emerald
-    Product: '#ec4899', // pink
+    customer: '#7c3aed', // purple
+    order: '#2563eb', // blue
+    delivery: '#06b6d4', // cyan
+    invoice: '#f59e0b', // amber
+    payment: '#10b981', // emerald
+    product: '#ec4899', // pink
 };
 
 // Detect current body theme ('dark' | 'light')
@@ -45,6 +45,7 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [selectedNodeData, setSelectedNodeData] = useState(null);
+    const [graphVersion, setGraphVersion] = useState(0);
 
     const applyForceLayout = useCallback((rawNodes, rawEdges) => {
         const simNodes = rawNodes.map(n => ({ ...n }));
@@ -145,11 +146,11 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
 
                 // 1. Customer
                 if (row.customer_name) {
-                    addNode(`cust-${row.customer_id}`, 'Customer', row.customer_name, { name: row.customer_name });
+                    addNode(`cust-${row.customer_id}`, 'customer', row.customer_name, { name: row.customer_name });
                 }
 
                 // 2. Order
-                addNode(`ord-${row.order_id}`, 'Order', `Order #${row.order_id}`, {
+                addNode(`ord-${row.order_id}`, 'order', `Order #${row.order_id}`, {
                     id: row.order_id,
                     amount: `${row.order_amount} ₹`,
                     status: row.delivery_status
@@ -160,7 +161,7 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
                 if (row.delivery_id) {
                     let label = `Delivery #${row.delivery_id}`;
                     if (row.goods_status === 'C') label += ' ✅';
-                    addNode(`del-${row.delivery_id}`, 'Delivery', label, {
+                    addNode(`del-${row.delivery_id}`, 'delivery', label, {
                         id: row.delivery_id,
                         ship_date: row.ship_date,
                         status: row.goods_status
@@ -171,7 +172,7 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
                 // 4. Invoice
                 if (row.invoice_id) {
                     const label = `Invoice #${row.invoice_id}`;
-                    addNode(`inv-${row.invoice_id}`, 'Invoice', label, {
+                    addNode(`inv-${row.invoice_id}`, 'invoice', label, {
                         id: row.invoice_id,
                         amount: `${row.invoice_amount} ₹`,
                         date: row.invoice_date,
@@ -185,22 +186,25 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
                 if (row.invoice_id) {
                     const payId = `pay-${row.invoice_id}`;
                     if (row.payment_id) {
-                        addNode(payId, 'Payment', `Paid ✅`, {
+                        addNode(payId, 'payment', `Paid ✅`, {
                             id: row.payment_id,
                             amount: `${row.payment_amount} ₹`,
                             date: row.clearing_date,
                             status: 'Paid'
                         }, '#10b981');
                     } else if (row.is_cancelled === 1) {
-                        addNode(payId, 'Payment', 'Cancelled ⚠️', { status: 'Invoice Cancelled' }, '#6b7280');
+                        addNode(payId, 'payment', 'Cancelled ⚠️', { status: 'Invoice Cancelled' }, '#6b7280');
                     } else {
-                        addNode(payId, 'Payment', 'Unpaid ❌', { status: 'Unpaid / Pending' }, '#ef4444');
+                        addNode(payId, 'payment', 'Unpaid ❌', { status: 'Unpaid / Pending' }, '#ef4444');
                     }
                     addEdge(`inv-${row.invoice_id}`, payId, row.payment_id ? 'payment received' : (row.is_cancelled ? 'halted' : 'awaiting payment'));
                 }
             });
 
+            setNodes([]);
+            setEdges([]);
             applyForceLayout(Array.from(uniqueNodes.values()), Array.from(uniqueEdges.values()));
+            setGraphVersion((v) => v + 1);
 
         } catch (err) {
             setError(err.message || 'Failed to fetch graph data.');
@@ -214,12 +218,17 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
     useEffect(() => {
         if (externalOrderQuery) {
             if (externalOrderQuery.nodes && externalOrderQuery.edges) {
-                // Render graph data directly
                 setLoading(true);
-                const styledNodes = externalOrderQuery.nodes.map(n => {
-                    const bg = NODE_COLORS[n.metadata.type] || '#888';
+                const styledNodes = externalOrderQuery.nodes.map((n) => {
+                    const nodeType = (n.type || n.data?.type || 'order').toLowerCase();
+                    const bg = NODE_COLORS[nodeType] || '#888';
                     return {
                         ...n,
+                        data: {
+                            ...(n.data || {}),
+                            label: n.data?.label || n.id,
+                            type: nodeType,
+                        },
                         style: {
                             background: bg,
                             color: '#ffffff',
@@ -252,7 +261,10 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
                         color: isDark ? 'rgba(255,255,255,0.4)' : '#000000'
                     }
                 }));
+                setNodes([]);
+                setEdges([]);
                 applyForceLayout(styledNodes, styledEdges);
+                setGraphVersion((v) => v + 1);
                 setLoading(false);
                 if (onClearExternal) onClearExternal();
             } else if (Array.isArray(externalOrderQuery)) {
@@ -296,7 +308,11 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
     }, [isDark, setNodes, setEdges]);
 
     const onNodeClick = (e, node) => {
-        setSelectedNodeData({ id: node.id, type: node.metadata.type, metadata: node.metadata });
+        setSelectedNodeData({
+            id: node.id,
+            type: node.data?.type || node.type,
+            metadata: node.data || {},
+        });
     };
 
     if (!nodes.length && !loading && !error) {
@@ -342,8 +358,9 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
                 </form>
             </div>
 
-            <ReactFlow
-                nodes={nodes}
+                    <ReactFlow
+                        key={graphVersion}
+                        nodes={nodes}
                 edges={edges}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
