@@ -142,10 +142,15 @@ export default function GraphView({ externalOrderQuery, onClearExternal }) {
     }, [isDark, setEdges, setNodes]);
 
     const onNodeClick = (_, node) => {
+        const context = node.data?.context && typeof node.data.context === 'object' ? node.data.context : {};
         setSelectedNodeData({
             id: node.id,
             type: node.data?.type || node.type,
-            metadata: node.data || {},
+            metadata: {
+                ...(context || {}),
+                entity_id: node.data?.id || node.id,
+                entity_type: node.data?.type || node.type,
+            },
         });
     };
 

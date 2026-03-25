@@ -167,6 +167,9 @@ _SQL_RESERVED = {
     "exists", "true", "false", "count", "sum", "avg", "min", "max", "coalesce",
     "cast", "to", "over", "partition", "row_number", "rank", "date", "now",
     "extract", "interval", "varchar", "text", "integer", "numeric", "boolean",
+    "current_date", "current_timestamp", "date_trunc", "to_char", "to_date",
+    "round", "greatest", "least", "substring", "upper", "lower", "concat",
+    "nullif", "jsonb_build_object", "json_agg", "array_agg", "unnest",
 }
 
 def validate_sql_columns(sql: str) -> Tuple[bool, List[str]]:
@@ -183,6 +186,7 @@ def validate_sql_columns(sql: str) -> Tuple[bool, List[str]]:
     cleaned = re.sub(r'"(?:[^"]|"")*"', '""', cleaned)
 
     table_aliases: Dict[str, str] = {}
+    derived_aliases: Set[str] = set()
     table_refs = re.findall(
         r"\b(from|join)\s+([a-z_][a-z0-9_]*)(?:\s+(?:as\s+)?([a-z_][a-z0-9_]*))?",
         cleaned,
@@ -195,6 +199,12 @@ def validate_sql_columns(sql: str) -> Tuple[bool, List[str]]:
         table_aliases[table] = table
         if alias and alias not in _SQL_RESERVED:
             table_aliases[alias] = table
+            derived_aliases.add(alias)
+
+    # Allow SELECT aliases so strict validation doesn't reject valid SQL.
+    for alias in re.findall(r"\bas\s+([a-z_][a-z0-9_]*)\b", cleaned):
+        if alias not in _SQL_RESERVED:
+            derived_aliases.add(alias)
 
     qualified_refs = re.findall(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b", cleaned)
     for qualifier, column in qualified_refs:
@@ -209,7 +219,7 @@ def validate_sql_columns(sql: str) -> Tuple[bool, List[str]]:
     cleaned_unqualified = re.sub(r"\b[0-9]+(?:\.[0-9]+)?\b", " ", cleaned_unqualified)
     tokens = re.findall(r"\b([a-z_][a-z0-9_]*)\b", cleaned_unqualified)
     seen_tokens = set(tokens)
-    table_alias_names = set(table_aliases.keys())
+    table_alias_names = set(table_aliases.keys()) | derived_aliases
     for tok in seen_tokens:
         if tok in _SQL_RESERVED:
             continue

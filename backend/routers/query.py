@@ -225,9 +225,10 @@ def sanitize_and_validate_sql(sql: str) -> Optional[str]:
 def format_small_result(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No matching data found."
-    lines: List[str] = [f"Found {len(rows)} result(s):"]
-    for row in itertools.islice(rows, 10):
-        pairs = [f"{k}: {v}" for k, v in row.items()]
+    lines: List[str] = [f"Found {len(rows)} result(s)."]
+    for row in itertools.islice(rows, 5):
+        keys = list(row.keys())[:6]
+        pairs = [f"{k}: {row.get(k)}" for k in keys]
         lines.append(f"- {', '.join(pairs)}")
     return "\n".join(lines)
 
@@ -287,6 +288,47 @@ def validate_sql_against_schema(sql: str, schema: Dict[str, Any]) -> Optional[st
         logger.warning("[SQL-VALIDATE] Rejected — unknown identifiers: %s", bad_tokens[:8])
         return None
     return sql
+
+
+def generate_sql_from_rules(question: str) -> Optional[str]:
+    """Deterministic SQL templates for common asks to reduce LLM failures."""
+    q = question.lower()
+    if "recent" in q and "order" in q:
+        return (
+            "SELECT sales_order, sold_to_party, creation_date, total_net_amount, overall_delivery_status "
+            "FROM sales_order_headers ORDER BY creation_date DESC LIMIT 20"
+        )
+    if ("customer" in q and "detail" in q) or ("customer" in q and "show" in q):
+        return (
+            "SELECT customer, business_partner_name, business_partner_full_name, business_partner_is_blocked, "
+            "business_partner_grouping, last_change_date "
+            "FROM business_partners ORDER BY customer LIMIT 20"
+        )
+    if "top" in q and ("product" in q or "material" in q):
+        return (
+            "SELECT soi.material, COUNT(*) AS order_count, SUM(soi.net_amount) AS total_net_amount "
+            "FROM sales_order_items soi GROUP BY soi.material ORDER BY total_net_amount DESC LIMIT 20"
+        )
+    if "unpaid" in q and "invoice" in q:
+        return (
+            "SELECT bdh.billing_document, bdh.sold_to_party, bdh.billing_document_date, bdh.total_net_amount "
+            "FROM billing_document_headers bdh "
+            "LEFT JOIN payments_accounts_receivable par ON bdh.accounting_document = par.accounting_document "
+            "WHERE par.clearing_date IS NULL AND bdh.billing_document_is_cancelled = FALSE "
+            "ORDER BY bdh.billing_document_date DESC LIMIT 20"
+        )
+    if "trace" in q and "order" in q:
+        return (
+            "SELECT soh.sales_order, soh.sold_to_party, odi.delivery_document, bdi.billing_document, "
+            "par.accounting_document AS payment_id "
+            "FROM sales_order_headers soh "
+            "LEFT JOIN outbound_delivery_items odi ON odi.reference_sd_document = soh.sales_order "
+            "LEFT JOIN billing_document_items bdi ON bdi.reference_sd_document = odi.delivery_document "
+            "LEFT JOIN billing_document_headers bdh ON bdh.billing_document = bdi.billing_document "
+            "LEFT JOIN payments_accounts_receivable par ON par.accounting_document = bdh.accounting_document "
+            "ORDER BY soh.creation_date DESC LIMIT 20"
+        )
+    return None
 
 
 # ── LLM calls (all blocking — run in thread pool) ────────────────────────────
@@ -421,6 +463,16 @@ async def generate_sql_from_llm(question: str, retry_context: Optional[Tuple[str
 
     normalized_question, _ = normalize_question(question)
     schema_str = schema_enforcer.build_schema_prompt()
+    if not retry_context:
+        rule_sql = generate_sql_from_rules(normalized_question)
+        if rule_sql:
+            sql_clean = sanitize_and_validate_sql(rule_sql)
+            if sql_clean:
+                sql_rule_final = validate_sql_against_schema(sql_clean, LIVE_SCHEMA)
+                if sql_rule_final:
+                    logger.info("[RULES] Using deterministic SQL template.")
+                    _sql_gen_cache.set(cache_key, sql_rule_final)
+                    return sql_rule_final
 
     try:
         if retry_context:
