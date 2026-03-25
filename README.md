@@ -64,7 +64,7 @@ Dodge AI provides a natural language interface for operational analytics:
 - Displays tabular query result preview alongside graph interactions
   
 ## Graph ConstrutionLogic
-<img width="935" height="1187" alt="graph logic" src="https://github.com/user-attachments/assets/fd367e12-b491-4803-8faa-35e6aca5eddd" />
+<img width="935" height="700" alt="graph logic" src="https://github.com/user-attachments/assets/fd367e12-b491-4803-8faa-35e6aca5eddd" />
 
 ### Backend (FastAPI)
 - `/query` endpoint for natural-language query processing
@@ -90,7 +90,7 @@ Dodge AI provides a natural language interface for operational analytics:
 - **Fallback:** summary fallback to Groq or deterministic formatter when needed
 - 
 ## Query Processing Flow
-<img width="5398" height="426" alt="query" src="https://github.com/user-attachments/assets/91264caa-2aaf-498c-9f74-10c7216036bb" />
+<img width="5398" height="700" alt="query" src="https://github.com/user-attachments/assets/91264caa-2aaf-498c-9f74-10c7216036bb" />
 ### End-to-End Flow
 
 `User → FastAPI → Groq (SQL) → SQL Validation → PostgreSQL → Graph Builder → Gemini/Groq Summary → React UI`
