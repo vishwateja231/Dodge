@@ -1,111 +1,125 @@
-"""Converts SQL rows into a stable graph payload: {nodes: [], edges: []}."""
+"""Row-true graph builder: builds nodes/edges strictly from each row's own values."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
-
-SUPPORTED_TYPES: Tuple[str, ...] = (
-    "customer",
-    "order",
-    "delivery",
-    "invoice",
-    "payment",
-    "product",
-)
-
-RELATION_LABELS: Dict[Tuple[str, str], str] = {
-    ("customer", "order"): "placed",
-    ("order", "delivery"): "fulfilled by",
-    ("delivery", "invoice"): "billed via",
-    ("order", "invoice"): "billed via",
-    ("invoice", "payment"): "paid by",
-    ("order", "product"): "contains",
-}
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
-def _node_id(entity_type: str, entity_value: Any) -> str:
-    return f"{entity_type}_{entity_value}"
+def _norm(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _merge_context(existing: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge only missing/empty fields; never overwrite non-empty existing values."""
+    merged = dict(existing)
+    for key, value in row.items():
+        if key not in merged or merged[key] in (None, "", []):
+            merged[key] = value
+    return merged
+
+
+def _upsert_node(
+    nodes_map: Dict[str, Dict[str, Any]],
+    entity_type: str,
+    entity_id: str,
+    row: Dict[str, Any],
+) -> str:
+    node_id = f"{entity_type}_{entity_id}"
+    new_data = {
+        "id": entity_id,
+        "type": entity_type,
+        "label": f"{entity_type.title()} {entity_id}",
+        "context": row,
+    }
+
+    if node_id not in nodes_map:
+        nodes_map[node_id] = {
+            "id": node_id,
+            "type": entity_type,
+            "data": new_data,
+        }
+    else:
+        existing_data = nodes_map[node_id].get("data", {})
+        existing_context = existing_data.get("context", {})
+        merged_context = _merge_context(existing_context if isinstance(existing_context, dict) else {}, row)
+        nodes_map[node_id]["data"] = {
+            **existing_data,
+            "context": merged_context,
+            "id": existing_data.get("id") or entity_id,
+            "type": existing_data.get("type") or entity_type,
+            "label": existing_data.get("label") or f"{entity_type.title()} {entity_id}",
+        }
+
+    return node_id
+
+
+def _add_edge(
+    edges_set: Set[Tuple[str, str]],
+    edges_map: Dict[str, Dict[str, Any]],
+    source_id: Optional[str],
+    target_id: Optional[str],
+) -> None:
+    if not source_id or not target_id or source_id == target_id:
+        return
+    pair = (source_id, target_id)
+    if pair in edges_set:
+        return
+    edges_set.add(pair)
+    edge_id = f"e_{source_id}_{target_id}"
+    edges_map[edge_id] = {
+        "id": edge_id,
+        "source": source_id,
+        "target": target_id,
+        "label": "related",
+    }
+    print("CREATED EDGE:", source_id, "→", target_id)
 
 
 def build_graph(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    graph: Dict[str, List[Dict[str, Any]]] = {"nodes": [], "edges": []}
     if not rows:
-        return graph
+        return {"nodes": [], "edges": []}
 
-    unique_nodes: Dict[str, Dict[str, Any]] = {}
-    unique_edges: Dict[str, Dict[str, Any]] = {}
+    nodes_map: Dict[str, Dict[str, Any]] = {}
+    edges_map: Dict[str, Dict[str, Any]] = {}
+    edges_set: Set[Tuple[str, str]] = set()
 
-    def add_node(entity_type: str, entity_value: Any, row: Dict[str, Any]) -> None:
-        if entity_value in (None, ""):
-            return
-        node_id = _node_id(entity_type, entity_value)
-        if node_id in unique_nodes:
-            return
-        label = f"{entity_type.title()} {entity_value}"
-        unique_nodes[node_id] = {
-            "id": node_id,
-            "type": entity_type,
+    for row in rows:
+        print("ROW:", row)
+
+        # STEP 1: Strict row-level extraction (this row only).
+        customer_id = _norm(row.get("customer_id")) or _norm(row.get("business_partner")) or _norm(row.get("customer"))
+        order_id = _norm(row.get("order_id")) or _norm(row.get("sales_order"))
+        invoice_id = _norm(row.get("invoice_id")) or _norm(row.get("billing_document"))
+        delivery_id = _norm(row.get("delivery_id")) or _norm(row.get("delivery_document"))
+        product_id = _norm(row.get("product_id")) or _norm(row.get("product")) or _norm(row.get("material"))
+
+        customer_node_id = _upsert_node(nodes_map, "customer", customer_id, row) if customer_id else None
+        order_node_id = _upsert_node(nodes_map, "order", order_id, row) if order_id else None
+        invoice_node_id = _upsert_node(nodes_map, "invoice", invoice_id, row) if invoice_id else None
+        delivery_node_id = _upsert_node(nodes_map, "delivery", delivery_id, row) if delivery_id else None
+        product_node_id = _upsert_node(nodes_map, "product", product_id, row) if product_id else None
+
+        # STEP 3: Edges only from same row.
+        _add_edge(edges_set, edges_map, customer_node_id, order_node_id)
+        _add_edge(edges_set, edges_map, order_node_id, invoice_node_id)
+        _add_edge(edges_set, edges_map, order_node_id, delivery_node_id)
+        _add_edge(edges_set, edges_map, order_node_id, product_node_id)
+
+    if not nodes_map and rows:
+        first_row = rows[0]
+        fallback_id = "record_0"
+        nodes_map[fallback_id] = {
+            "id": fallback_id,
+            "type": "record",
             "data": {
-                "id": entity_value,
-                "label": label,
-                "type": entity_type,
-                **row,
+                "id": fallback_id,
+                "type": "record",
+                "label": "Result Row",
+                "context": first_row,
             },
         }
 
-    def add_edge(source_type: str, source_value: Any, target_type: str, target_value: Any) -> None:
-        if source_value in (None, "") or target_value in (None, ""):
-            return
-        source_id = _node_id(source_type, source_value)
-        target_id = _node_id(target_type, target_value)
-        if source_id not in unique_nodes or target_id not in unique_nodes:
-            return
-        label = RELATION_LABELS.get((source_type, target_type), "related")
-        edge_id = f"e_{source_id}_{target_id}"
-        if edge_id in unique_edges:
-            return
-        unique_edges[edge_id] = {
-            "id": edge_id,
-            "source": source_id,
-            "target": target_id,
-            "label": label,
-        }
-
-    # Map of generic node types to the possible SAP column names that contain their IDs
-    ENTITY_COLUMNS: Dict[str, List[str]] = {
-        "customer": ["customer", "business_partner", "sold_to_party"],
-        "order":    ["sales_order"],
-        "delivery": ["delivery_document"],
-        "invoice":  ["billing_document", "invoice_reference"],
-        "payment":  ["accounting_document"],
-        "product":  ["product", "material"],
-    }
-
-    for row in rows:
-        entity_values: Dict[str, Any] = {}
-        
-        # 1. First extract generic entity IDs from the row using SAP column names
-        for entity_type, possible_cols in ENTITY_COLUMNS.items():
-            # also check the legacy *_id name just in case Aliases were used
-            possible_cols.append(f"{entity_type}_id") 
-            
-            for col in possible_cols:
-                if col in row and row[col] not in (None, ""):
-                    entity_values[entity_type] = str(row[col])
-                    break # Found the ID for this entity type in this row
-
-        # 2. Add nodes for any entities found in this row
-        for entity_type, entity_id in entity_values.items():
-            add_node(entity_type, entity_id, row)
-
-        # 3. Canonical O2C chain edges when IDs are present.
-        add_edge("customer", entity_values.get("customer"), "order", entity_values.get("order"))
-        add_edge("order", entity_values.get("order"), "delivery", entity_values.get("delivery"))
-        add_edge("delivery", entity_values.get("delivery"), "invoice", entity_values.get("invoice"))
-        add_edge("order", entity_values.get("order"), "invoice", entity_values.get("invoice"))
-        add_edge("invoice", entity_values.get("invoice"), "payment", entity_values.get("payment"))
-        add_edge("order", entity_values.get("order"), "product", entity_values.get("product"))
-
-    graph["nodes"] = [node for node in unique_nodes.values()]
-    graph["edges"] = [edge for edge in unique_edges.values()]
-    return graph
+    return {"nodes": list(nodes_map.values()), "edges": list(edges_map.values())}

@@ -5,11 +5,10 @@ Flow:
 1) Schema loaded from schema_enforcer (schema.json / live DB fallback)
 2) Guardrails — reject non-dataset queries
 3) Groq generates SQL from strict SAP schema prompt
-4) Auto-correct phantom column/table names
-5) SQL validation — allow only SELECT/WITH + LIMIT
-6) Column validation against real SAP schema
+4) SQL validation — allow only SELECT/WITH + LIMIT
+5) Strict column validation against real SAP schema
 7) Async PostgreSQL execution
-8) On DB error → auto-retry with error context sent back to LLM
+8) On DB error → one retry with error context sent back to LLM
 9) Graph builder — {nodes, edges} from result rows
 10) Gemini summarizes if >10 rows
 11) Consistent response: {type, summary, total, data, graph}
@@ -149,12 +148,9 @@ DATASET_KEYWORDS = {
 
 SQL_PROMPT_TEMPLATE = """You are a PostgreSQL expert working with an SAP Order-to-Cash database.
 
-{column_mapping}
-
 STRICT RULES — VIOLATION WILL CAUSE QUERY FAILURE:
 1. Use ONLY the tables and columns from the SCHEMA below. DO NOT invent column names.
-2. DO NOT use: customer_id, order_id, product_id, invoice_id, payment_id, delivery_id
-   — these columns do NOT exist. Use the MAPPING above instead.
+2. Do NOT invent aliases for missing columns. Use exact schema names only.
 3. Always use explicit column names. No SELECT *.
 4. All ID/text values in WHERE clauses MUST be wrapped in single quotes:
    e.g. sold_to_party = '320000085'  NOT  sold_to_party = 320000085
@@ -175,8 +171,6 @@ SQL_VALIDATOR_PROMPT_TEMPLATE = """You are a strict PostgreSQL SQL validator for
 
 Validate and fix the SQL below so it correctly answers: "{question}"
 
-{column_mapping}
-
 SCHEMA:
 {schema}
 
@@ -184,9 +178,9 @@ SQL TO VALIDATE:
 {sql}
 
 VALIDATION CHECKLIST:
-1. Every table name MUST exist in the SCHEMA. Replace any phantom table with the correct SAP table.
-2. Every column name MUST exist in the SCHEMA. Remove or replace any hallucinated column.
-3. Use MAPPING above to fix wrong column names (e.g. customer_id → customer, order_id → sales_order).
+1. Every table name MUST exist in the SCHEMA.
+2. Every column name MUST exist in the SCHEMA.
+3. Do NOT invent columns or tables and do NOT use any mapping.
 4. All literal values in WHERE clauses must be single-quoted.
 5. Apply LIMIT 20 if missing.
 6. Use proper LEFT JOINs via the JOIN HINTS for rich results.
@@ -231,9 +225,10 @@ def sanitize_and_validate_sql(sql: str) -> Optional[str]:
 def format_small_result(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No matching data found."
-    lines: List[str] = [f"Found {len(rows)} result(s):"]
-    for row in itertools.islice(rows, 10):
-        pairs = [f"{k}: {v}" for k, v in row.items()]
+    lines: List[str] = [f"Found {len(rows)} result(s)."]
+    for row in itertools.islice(rows, 5):
+        keys = list(row.keys())[:6]
+        pairs = [f"{k}: {row.get(k)}" for k in keys]
         lines.append(f"- {', '.join(pairs)}")
     return "\n".join(lines)
 
@@ -241,12 +236,12 @@ def format_small_result(rows: List[Dict[str, Any]]) -> str:
 def _error_response(msg: str, detail: str = "") -> Dict[str, Any]:
     return {
         "type": "error",
-        "message": detail or msg,
+        "message": msg if msg == "Invalid column in query" else (detail or msg),
     }
 
 
 def _empty_response(message: str = "No data found") -> Dict[str, Any]:
-    return {"type": "empty", "message": message}
+    return {"type": "empty", "message": message, "graph": {"nodes": [], "edges": []}}
 
 
 def normalize_question(question: str) -> Tuple[str, Dict[str, str]]:
@@ -295,6 +290,47 @@ def validate_sql_against_schema(sql: str, schema: Dict[str, Any]) -> Optional[st
     return sql
 
 
+def generate_sql_from_rules(question: str) -> Optional[str]:
+    """Deterministic SQL templates for common asks to reduce LLM failures."""
+    q = question.lower()
+    if "recent" in q and "order" in q:
+        return (
+            "SELECT sales_order, sold_to_party, creation_date, total_net_amount, overall_delivery_status "
+            "FROM sales_order_headers ORDER BY creation_date DESC LIMIT 20"
+        )
+    if ("customer" in q and "detail" in q) or ("customer" in q and "show" in q):
+        return (
+            "SELECT customer, business_partner_name, business_partner_full_name, business_partner_is_blocked, "
+            "business_partner_grouping, last_change_date "
+            "FROM business_partners ORDER BY customer LIMIT 20"
+        )
+    if "top" in q and ("product" in q or "material" in q):
+        return (
+            "SELECT soi.material, COUNT(*) AS order_count, SUM(soi.net_amount) AS total_net_amount "
+            "FROM sales_order_items soi GROUP BY soi.material ORDER BY total_net_amount DESC LIMIT 20"
+        )
+    if "unpaid" in q and "invoice" in q:
+        return (
+            "SELECT bdh.billing_document, bdh.sold_to_party, bdh.billing_document_date, bdh.total_net_amount "
+            "FROM billing_document_headers bdh "
+            "LEFT JOIN payments_accounts_receivable par ON bdh.accounting_document = par.accounting_document "
+            "WHERE par.clearing_date IS NULL AND bdh.billing_document_is_cancelled = FALSE "
+            "ORDER BY bdh.billing_document_date DESC LIMIT 20"
+        )
+    if "trace" in q and "order" in q:
+        return (
+            "SELECT soh.sales_order, soh.sold_to_party, odi.delivery_document, bdi.billing_document, "
+            "par.accounting_document AS payment_id "
+            "FROM sales_order_headers soh "
+            "LEFT JOIN outbound_delivery_items odi ON odi.reference_sd_document = soh.sales_order "
+            "LEFT JOIN billing_document_items bdi ON bdi.reference_sd_document = odi.delivery_document "
+            "LEFT JOIN billing_document_headers bdh ON bdh.billing_document = bdi.billing_document "
+            "LEFT JOIN payments_accounts_receivable par ON par.accounting_document = bdh.accounting_document "
+            "ORDER BY soh.creation_date DESC LIMIT 20"
+        )
+    return None
+
+
 # ── LLM calls (all blocking — run in thread pool) ────────────────────────────
 
 def _groq_call(question: str, schema_str: str) -> Dict[str, Any]:
@@ -302,8 +338,7 @@ def _groq_call(question: str, schema_str: str) -> Dict[str, Any]:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY not set")
     client = Groq(api_key=GROQ_API_KEY)
-    mapping_str = schema_enforcer.build_column_mapping_prompt()
-    prompt = SQL_PROMPT_TEMPLATE.format(schema=schema_str, column_mapping=mapping_str)
+    prompt = SQL_PROMPT_TEMPLATE.format(schema=schema_str)
     resp = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         response_format={"type": "json_object"},
@@ -321,9 +356,8 @@ def _groq_call(question: str, schema_str: str) -> Dict[str, Any]:
 def _groq_validate_sql_call(question: str, sql: str, schema_str: str) -> Dict[str, Any]:
     from groq import Groq  # pyre-ignore[21]
     client = Groq(api_key=GROQ_API_KEY)
-    mapping_str = schema_enforcer.build_column_mapping_prompt()
     prompt = SQL_VALIDATOR_PROMPT_TEMPLATE.format(
-        schema=schema_str, question=question, sql=sql, column_mapping=mapping_str
+        schema=schema_str, question=question, sql=sql
     )
     resp = client.chat.completions.create(
         model="llama-3.1-8b-instant",
@@ -356,6 +390,21 @@ def _groq_retry_call(question: str, failed_sql: str, error_msg: str) -> Dict[str
     )
     content = resp.choices[0].message.content or "{}"
     return json.loads(content)  # type: ignore[return-value]
+
+
+def _gemini_sql_call(question: str, schema_str: str) -> Dict[str, Any]:
+    import google.generativeai as genai  # pyre-ignore[21]
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        generation_config=genai.types.GenerationConfig(temperature=0.0, max_output_tokens=400),  # pyre-ignore[16]
+    )
+    prompt = SQL_PROMPT_TEMPLATE.format(schema=schema_str)
+    result = model.generate_content([prompt, f"Question: {question}"])
+    text = (result.text or "{}").strip()
+    return json.loads(text)  # type: ignore[return-value]
 
 
 def _gemini_call(question: str, sql: str, rows: List[Dict[str, Any]]) -> str:
@@ -414,6 +463,16 @@ async def generate_sql_from_llm(question: str, retry_context: Optional[Tuple[str
 
     normalized_question, _ = normalize_question(question)
     schema_str = schema_enforcer.build_schema_prompt()
+    if not retry_context:
+        rule_sql = generate_sql_from_rules(normalized_question)
+        if rule_sql:
+            sql_clean = sanitize_and_validate_sql(rule_sql)
+            if sql_clean:
+                sql_rule_final = validate_sql_against_schema(sql_clean, LIVE_SCHEMA)
+                if sql_rule_final:
+                    logger.info("[RULES] Using deterministic SQL template.")
+                    _sql_gen_cache.set(cache_key, sql_rule_final)
+                    return sql_rule_final
 
     try:
         if retry_context:
@@ -448,19 +507,27 @@ async def generate_sql_from_llm(question: str, retry_context: Optional[Tuple[str
     except asyncio.TimeoutError:
         raise ValueError("LLM timeout — Groq did not respond within 14 seconds")
     except Exception as exc:
-        if is_llm_rate_error(str(exc)):
+        if is_llm_rate_error(str(exc)) and not retry_context:
+            logger.warning("[GROQ] Rate-limited. Falling back to Gemini SQL generation.")
+            await asyncio.sleep(1.0)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_gemini_sql_call, normalized_question, schema_str),  # pyre-ignore[6]
+                    timeout=14.0,
+                )
+                sql_validated = str(result.get("sql", "")).strip()
+                logger.info("[GEMINI] Fallback SQL: %s", _trunc(sql_validated))
+            except Exception as gemini_exc:
+                logger.warning("[GEMINI] SQL fallback failed: %s", gemini_exc)
+                raise ValueError("LLM limit exceeded")
+        elif is_llm_rate_error(str(exc)):
             raise ValueError("LLM limit exceeded")
         logger.warning("[GROQ] Error: %s", exc)
-        return None
-
-    # ── Step 6: Auto-correct phantom column/table names ───────────────────────
-    sql_corrected, corrections = schema_enforcer.autocorrect_sql(sql_validated)
-    if corrections:
-        c_list = list(corrections)
-        logger.info("[AUTOCORRECT] %d corrections applied: %s", len(c_list), ", ".join(c_list))
+        if "sql_validated" not in locals():
+            return None
 
     # ── Step 4 (syntax): Ensure SELECT/WITH + LIMIT ───────────────────────────
-    sql_clean = sanitize_and_validate_sql(sql_corrected)
+    sql_clean = sanitize_and_validate_sql(sql_validated)
 
     # ── Step 5: Column validation against real SAP schema ─────────────────────
     if sql_clean:
@@ -513,7 +580,7 @@ async def summarize(question: str, sql: str, rows: List[Dict[str, Any]]) -> str:
 
 
 async def build_query_response(question: str) -> Dict[str, Any]:
-    """Full pipeline with auto-correct, schema enforcement, and retry-on-error."""
+    """Full pipeline with strict schema enforcement and single retry-on-error."""
     try:
         logger.info("[DEBUG] build_query_response started for: %s", question)
 
@@ -525,7 +592,7 @@ async def build_query_response(question: str) -> Dict[str, Any]:
         logger.info("[DEBUG] SQL generated: %s", sql)
 
         if not sql:
-            return _error_response("Could not generate valid SQL for this query.")
+            return _error_response("Invalid column in query")
 
         # ── Step 7: Execute SQL ───────────────────────────────────────────────
         db_result = await run_sql(sql)
@@ -540,10 +607,11 @@ async def build_query_response(question: str) -> Dict[str, Any]:
             failed_sql: str = str(failed_sql_raw)
 
             logger.warning("[RETRY] DB error '%s'. Retrying SQL generation...", _trunc(error_msg, 80))
-
+            await asyncio.sleep(1.0)
             sql_retry = await generate_sql_from_llm(question, retry_context=(failed_sql, error_msg))
             if sql_retry and sql_retry != sql:
                 logger.info("[RETRY] Retrying with corrected SQL: %s", _trunc(sql_retry))
+                await asyncio.sleep(1.0)
                 db_result = await run_sql(sql_retry)
                 sql = sql_retry
 
